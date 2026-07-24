@@ -19,7 +19,10 @@ ENV/
 *~
 generated/
 uploads/
-models/
+# Downloaded ML model weights (mounted at /app/models in Docker).
+# Anchored to the service root so it does NOT ignore the app/models
+# Python package.
+/models/
 *.wav
 *.mp3
 *.mp4
