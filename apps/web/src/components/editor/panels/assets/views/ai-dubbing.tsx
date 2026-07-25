@@ -1,9 +1,13 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useEditor } from "@/hooks/use-editor";
 import { useTranscriptStore } from "@/stores/transcript-store";
-import { useAIDubbing, type DubbingEngine } from "@/hooks/use-ai-dubbing";
+import {
+	useAIDubbing,
+	type DubbingEngine,
+	type DubbingScope,
+} from "@/hooks/use-ai-dubbing";
 import {
 	Select,
 	SelectContent,
@@ -13,6 +17,7 @@ import {
 } from "@/components/ui/select";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
+import { Switch } from "@/components/ui/switch";
 import { cn } from "@/utils/ui";
 import { SARVAM_TTS_LANGUAGES, SARVAM_TTS_SPEAKERS } from "@/constants/sarvam-constants";
 import { toast } from "sonner";
@@ -63,6 +68,11 @@ const ENGINES: Array<{
 	},
 ];
 
+const SCOPES: Array<{ value: DubbingScope; label: string }> = [
+	{ value: "narrator", label: "Narrator only" },
+	{ value: "all", label: "All segments" },
+];
+
 export function AIDubbingPanel() {
 	const segments = useTranscriptStore((s) => s.segments);
 	const language = useTranscriptStore((s) => s.language);
@@ -72,6 +82,17 @@ export function AIDubbingPanel() {
 	const [targetLanguage, setTargetLanguage] = useState("hi");
 	const [engine, setEngine] = useState<DubbingEngine>("sarvam");
 	const [voiceId, setVoiceId] = useState("shubh");
+	const [scopeChoice, setScopeChoice] = useState<DubbingScope | null>(null);
+	const [replaceOriginal, setReplaceOriginal] = useState(true);
+
+	const narratorCount = useMemo(
+		() => segments.filter((seg) => seg.role === "narrator").length,
+		[segments],
+	);
+	// Default to narrator-only once roles are assigned; an explicit pick wins.
+	const scope: DubbingScope =
+		scopeChoice ?? (narratorCount > 0 ? "narrator" : "all");
+	const missingNarratorRoles = scope === "narrator" && narratorCount === 0;
 
 	const isSarvamLang = SARVAM_TTS_LANGUAGES.some(
 		(l) => l.code === targetLanguage,
@@ -86,12 +107,30 @@ export function AIDubbingPanel() {
 			toast.error("Target language is same as source.");
 			return;
 		}
+		if (missingNarratorRoles) {
+			toast.error(
+				'No narrator roles assigned. Use "Classify roles" in the Transcript panel, or dub all segments.',
+			);
+			return;
+		}
 		runDubbing({
 			targetLanguage,
 			engine,
 			voiceId,
+			scope,
+			replaceOriginal,
 		});
-	}, [segments, language, targetLanguage, engine, voiceId, runDubbing]);
+	}, [
+		segments,
+		language,
+		targetLanguage,
+		engine,
+		voiceId,
+		scope,
+		missingNarratorRoles,
+		replaceOriginal,
+		runDubbing,
+	]);
 
 	const voiceOptions =
 		engine === "sarvam"
@@ -208,6 +247,52 @@ export function AIDubbingPanel() {
 						))}
 					</SelectContent>
 				</Select>
+			</div>
+
+			<div className="flex flex-col gap-1.5">
+				<Label className="text-[10px]">Segments to dub</Label>
+				<div className="grid grid-cols-2 gap-1">
+					{SCOPES.map((s) => {
+						const isActive = scope === s.value;
+						return (
+							<button
+								key={s.value}
+								type="button"
+								onClick={() => setScopeChoice(s.value)}
+								className={cn(
+									"rounded-md border px-2 py-1.5 text-[10px] font-medium transition-colors",
+									isActive
+										? "border-primary/40 bg-primary/5"
+										: "border-border hover:bg-accent cursor-pointer",
+								)}
+							>
+								{s.label}
+							</button>
+						);
+					})}
+				</div>
+				<span className="text-[9px] text-muted-foreground">
+					{narratorCount} narrator / {segments.length} total segments
+				</span>
+				{missingNarratorRoles && (
+					<p className="rounded-md bg-yellow-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-yellow-500">
+						No narrator roles assigned yet. Use &quot;Classify roles&quot; in
+						the Transcript panel, or switch to &quot;All segments&quot;.
+					</p>
+				)}
+			</div>
+
+			<div className="flex items-center justify-between">
+				<div className="flex flex-col">
+					<Label className="text-[10px]">Replace original audio</Label>
+					<span className="text-[9px] text-muted-foreground">
+						Mutes source audio under dubbed segments
+					</span>
+				</div>
+				<Switch
+					checked={replaceOriginal}
+					onCheckedChange={setReplaceOriginal}
+				/>
 			</div>
 
 			{progress && (

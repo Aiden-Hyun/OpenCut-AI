@@ -1,0 +1,9 @@
+# Local-dev override: use the host machine's Ollama instead of the
+# containerized one (which cannot bind port 11434 when host Ollama runs).
+# Usage: docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --no-deps ai-backend
+services:
+  ai-backend:
+    environment:
+      - OPENCUTAI_OLLAMA_URL=http://host.docker.internal:11434
+      # llama3.2 (3B) produces broken Korean; qwen2.5 14B translates EN->KO well.
+      - OPENCUTAI_OLLAMA_DEFAULT_MODEL=qwen2.5-coder:14b

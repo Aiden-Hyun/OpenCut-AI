@@ -41,6 +41,10 @@ import {
 	computeReorderTimeline,
 	type TimeRange,
 } from "@/lib/text-timeline-sync";
+import { useTranscriptStore } from "@/stores/transcript-store";
+import { proposeSegmentRoles } from "@/lib/transcription/segment-roles";
+import type { SegmentRole } from "@/types/ai";
+import { toast } from "sonner";
 
 // ----- Types -----
 
@@ -331,6 +335,52 @@ export function TranscriptionPanel({
 		setMarkedWords(new Map());
 	}, []);
 
+	// ----- Segment roles (narrator/field for localization) -----
+	// Roles live on the transcript store's segments; the panel's segment ids
+	// are the store ids stringified, so roles are looked up via the store.
+	const storeSegments = useTranscriptStore((s) => s.segments);
+	const segmentRoles = useMemo(() => {
+		const map = new Map<string, SegmentRole>();
+		for (const seg of storeSegments) {
+			if (seg.role) map.set(String(seg.id), seg.role);
+		}
+		return map;
+	}, [storeSegments]);
+
+	const handleToggleRole = useCallback((segmentId: string) => {
+		const store = useTranscriptStore.getState();
+		const seg = store.segments.find((s) => s.id === Number(segmentId));
+		if (!seg) return;
+		// Unassigned segments become "narrator" first; after that, toggle.
+		store.updateSegment(seg.id, {
+			role: seg.role === "narrator" ? "field" : "narrator",
+		});
+	}, []);
+
+	const handleClassifyRoles = useCallback(() => {
+		const store = useTranscriptStore.getState();
+		const { narratorSpeaker, roles, confidence } = proposeSegmentRoles({
+			segments: store.segments,
+		});
+
+		if (!narratorSpeaker) {
+			toast.error("Cannot classify roles without speakers", {
+				description:
+					'Run "Detect speakers" first so segments can be split into narrator and field audio.',
+			});
+			return;
+		}
+
+		store.setSegmentRoles(roles);
+		const narratorCount = Object.values(roles).filter(
+			(role) => role === "narrator",
+		).length;
+		const narratorName = store.speakerNames[narratorSpeaker] ?? narratorSpeaker;
+		toast.success(
+			`Narrator: ${narratorName} (${narratorCount} segments, ${Math.round(confidence * 100)}%)`,
+		);
+	}, []);
+
 	// ----- Drag-and-drop -----
 	const handleDragEnd = useCallback(
 		(result: DropResult) => {
@@ -425,6 +475,25 @@ export function TranscriptionPanel({
 									"Detect speakers"
 								)}
 							</Button>
+						)}
+
+						{/* Classify roles button — proposes narrator/field roles from diarized speakers */}
+						{status === "complete" && segments.length > 0 && (
+							<Tooltip>
+								<TooltipTrigger asChild>
+									<Button
+										variant="outline"
+										size="sm"
+										onClick={handleClassifyRoles}
+									>
+										Classify roles
+									</Button>
+								</TooltipTrigger>
+								<TooltipContent>
+									Propose narrator/field roles per segment for
+									localization
+								</TooltipContent>
+							</Tooltip>
 						)}
 
 						<Button
@@ -621,6 +690,8 @@ export function TranscriptionPanel({
 												);
 											const segmentMarks =
 												markedWords.get(segment.id);
+											const segmentRole =
+												segmentRoles.get(segment.id);
 
 											const isActiveSegment = isSegmentActive(segment, currentTime);
 
@@ -782,6 +853,53 @@ export function TranscriptionPanel({
 																				segment.startTime,
 																			)}
 																		</button>
+
+																		{/* Role chip — narrator (dubbed) / field (kept in original language) */}
+																		<Tooltip>
+																			<TooltipTrigger
+																				asChild
+																			>
+																				<button
+																					type="button"
+																					onClick={(
+																						e,
+																					) => {
+																						e.stopPropagation();
+																						handleToggleRole(
+																							segment.id,
+																						);
+																					}}
+																					className={cn(
+																						"rounded-full border px-1.5 py-px text-[9px] font-medium leading-4 transition-colors",
+																						segmentRole ===
+																							"narrator" &&
+																							"border-primary/30 bg-primary/10 text-primary hover:bg-primary/20",
+																						segmentRole ===
+																							"field" &&
+																							"border-border bg-muted text-muted-foreground hover:bg-accent",
+																						!segmentRole &&
+																							"border-dashed border-border text-muted-foreground/50 hover:text-muted-foreground hover:bg-accent",
+																					)}
+																				>
+																					{segmentRole ===
+																					"narrator"
+																						? "Narrator"
+																						: segmentRole ===
+																								"field"
+																							? "Field"
+																							: "No role"}
+																				</button>
+																			</TooltipTrigger>
+																			<TooltipContent>
+																				{segmentRole ===
+																				"narrator"
+																					? "Narrator voiceover — dubbed when localizing. Click to mark as field."
+																					: segmentRole ===
+																							"field"
+																						? "Field audio — kept in the original language. Click to mark as narrator."
+																						: "No localization role. Click to mark as narrator."}
+																			</TooltipContent>
+																		</Tooltip>
 																	</div>
 
 																	{/* Words */}
