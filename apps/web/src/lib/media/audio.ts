@@ -4,19 +4,56 @@ import type {
 	TimelineElement,
 	TimelineTrack,
 } from "@/types/timeline";
+import type { ElementAnimations, NumberAnimationChannel } from "@/types/animation";
 import type { MediaAsset } from "@/types/assets";
 import { canElementHaveAudio } from "@/lib/timeline/element-utils";
 import { canTracktHaveAudio } from "@/lib/timeline";
+import { getNumberChannelForPath } from "@/lib/animation/number-channel";
+import { createVolumeSampler } from "@/lib/animation/volume-automation";
 import { mediaSupportsAudio } from "@/lib/media/media-utils";
 import { Input, ALL_FORMATS, BlobSource, AudioBufferSink } from "mediabunny";
 
 const MAX_AUDIO_CHANNELS = 2;
 const EXPORT_SAMPLE_RATE = 44100;
 
-export type CollectedAudioElement = Omit<
-	AudioElement,
-	"type" | "mediaId" | "volume" | "id" | "name" | "sourceType" | "sourceUrl"
-> & { buffer: AudioBuffer };
+export interface CollectedAudioElement {
+	buffer: AudioBuffer;
+	startTime: number;
+	duration: number;
+	trimStart: number;
+	trimEnd: number;
+	muted?: boolean;
+	/** Element's static volume; replaced by volumeChannel when one exists. */
+	volume: number;
+	/** Track volume × solo attenuation, applied on top of the element gain. */
+	trackGain: number;
+	volumeChannel?: NumberAnimationChannel;
+}
+
+function getVolumeChannel({
+	animations,
+}: {
+	animations: ElementAnimations | undefined;
+}): NumberAnimationChannel | undefined {
+	const channel = getNumberChannelForPath({
+		animations,
+		propertyPath: "volume",
+	});
+	return channel && channel.keyframes.length > 0 ? channel : undefined;
+}
+
+function getTrackGain({
+	track,
+	soloActive,
+}: {
+	track: TimelineTrack;
+	soloActive: boolean;
+}): number {
+	const soloed = "solo" in track ? (track.solo ?? false) : false;
+	if (soloActive && !soloed) return 0;
+	const volume = "volume" in track ? (track.volume ?? 1) : 1;
+	return volume;
+}
 
 export function createAudioContext({ sampleRate }: { sampleRate?: number } = {}): AudioContext {
 	const AudioContextConstructor =
@@ -70,9 +107,12 @@ export async function collectAudioElements({
 		mediaAssets.map((media) => [media.id, media]),
 	);
 	const pendingElements: Array<Promise<CollectedAudioElement | null>> = [];
+	const soloActive = tracks.some((track) => "solo" in track && track.solo);
 
 	for (const track of tracks) {
 		if (canTracktHaveAudio(track) && track.muted) continue;
+
+		const trackGain = getTrackGain({ track, soloActive });
 
 		for (const element of track.elements) {
 			if (!canElementHaveAudio(element)) continue;
@@ -95,6 +135,11 @@ export async function collectAudioElements({
 							trimStart: element.trimStart,
 							trimEnd: element.trimEnd,
 							muted: element.muted || isTrackMuted,
+							volume: element.volume ?? 1,
+							trackGain,
+							volumeChannel: getVolumeChannel({
+								animations: element.animations,
+							}),
 						};
 					}),
 				);
@@ -119,6 +164,11 @@ export async function collectAudioElements({
 							trimStart: element.trimStart,
 							trimEnd: element.trimEnd,
 							muted: elementMuted || isTrackMuted,
+							volume: 1,
+							trackGain,
+							volumeChannel: getVolumeChannel({
+								animations: element.animations,
+							}),
 						};
 					}),
 				);
@@ -253,6 +303,8 @@ export interface AudioClipSource {
 	trimEnd: number;
 	muted: boolean;
 	volume: number;
+	playbackRate?: number;
+	animations?: ElementAnimations;
 }
 
 async function fetchLibraryAudioSource({
@@ -312,6 +364,8 @@ async function fetchLibraryAudioClip({
 			trimEnd: element.trimEnd,
 			muted,
 			volume: element.volume ?? 1,
+			playbackRate: element.playbackRate,
+			animations: element.animations,
 		};
 	} catch (error) {
 		console.warn("Failed to fetch library audio:", error);
@@ -345,6 +399,10 @@ function collectMediaAudioClip({
 	muted: boolean;
 }): AudioClipSource {
 	const vol = "volume" in element ? (element as { volume?: number }).volume ?? 1 : 1;
+	const playbackRate =
+		"playbackRate" in element
+			? (element as { playbackRate?: number }).playbackRate
+			: undefined;
 	return {
 		id: element.id,
 		sourceKey: mediaAsset.id,
@@ -355,6 +413,8 @@ function collectMediaAudioClip({
 		trimEnd: element.trimEnd,
 		muted,
 		volume: vol,
+		playbackRate,
+		animations: element.animations,
 	};
 }
 
@@ -511,6 +571,8 @@ export async function createTimelineAudioBuffer({
 
 	for (const element of audioElements) {
 		if (element.muted) continue;
+		if (element.trackGain === 0) continue;
+		if (element.volume === 0 && !element.volumeChannel) continue;
 
 		mixAudioChannels({
 			element,
@@ -548,6 +610,12 @@ function mixAudioChannels({
 		const outputData = outputBuffer.getChannelData(channel);
 		const sourceChannel = Math.min(channel, buffer.numberOfChannels - 1);
 		const sourceData = buffer.getChannelData(sourceChannel);
+		// Sampler cursor is monotonic, so each channel pass needs its own.
+		const sampleVolume = createVolumeSampler({
+			channel: element.volumeChannel,
+			fallbackValue: element.volume,
+		});
+		const trackGain = element.trackGain;
 
 		for (let i = 0; i < resampledLength; i++) {
 			const outputIndex = outputStartSample + i;
@@ -556,7 +624,8 @@ function mixAudioChannels({
 			const sourceIndex = sourceStartSample + Math.floor(i / resampleRatio);
 			if (sourceIndex >= sourceData.length) break;
 
-			outputData[outputIndex] += sourceData[sourceIndex];
+			const gain = sampleVolume(i / sampleRate) * trackGain;
+			outputData[outputIndex] += sourceData[sourceIndex] * gain;
 		}
 	}
 }

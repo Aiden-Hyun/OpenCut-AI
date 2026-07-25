@@ -1,6 +1,8 @@
 import type { EditorCore } from "@/core";
 import type { AudioClipSource } from "@/lib/media/audio";
 import { createAudioContext, collectAudioClips } from "@/lib/media/audio";
+import { getNumberChannelForPath } from "@/lib/animation/number-channel";
+import { scheduleVolumeAutomation } from "@/lib/animation/volume-automation";
 import {
 	ALL_FORMATS,
 	AudioBufferSink,
@@ -394,15 +396,38 @@ export class AudioManager {
 				node.buffer = buffer;
 
 				// Apply per-clip playback rate (speed control)
-				const clipRate = (clip as unknown as { playbackRate?: number }).playbackRate;
-				if (typeof clipRate === "number" && clipRate !== 1.0) {
+				const clipRate = clip.playbackRate ?? 1;
+				if (clipRate !== 1.0) {
 					node.playbackRate.value = clipRate;
 				}
 
 				const destinationNode = this.getTrackDestination(clip.id);
 
+				const startTimestamp =
+					this.playbackStartContextTime +
+					this.playbackLatencyCompensationSeconds +
+					(timelineTime - this.playbackStartTime);
+
 				const clipVolume = clip.volume ?? 1;
-				if (clipVolume < 1) {
+				const volumeChannel = getNumberChannelForPath({
+					animations: clip.animations,
+					propertyPath: "volume",
+				});
+				if (volumeChannel && volumeChannel.keyframes.length > 0) {
+					const clipGain = audioContext.createGain();
+					const chunkLocalStart = timelineTime - clip.startTime;
+					scheduleVolumeAutomation({
+						param: clipGain.gain,
+						channel: volumeChannel,
+						fromLocalTime: chunkLocalStart,
+						toLocalTime: chunkLocalStart + buffer.duration,
+						contextTimeAtFrom: startTimestamp,
+						now: audioContext.currentTime,
+						playbackRate: clipRate,
+					});
+					node.connect(clipGain);
+					clipGain.connect(destinationNode);
+				} else if (clipVolume !== 1) {
 					const clipGain = audioContext.createGain();
 					clipGain.gain.value = clipVolume;
 					node.connect(clipGain);
@@ -410,11 +435,6 @@ export class AudioManager {
 				} else {
 					node.connect(destinationNode);
 				}
-
-				const startTimestamp =
-					this.playbackStartContextTime +
-					this.playbackLatencyCompensationSeconds +
-					(timelineTime - this.playbackStartTime);
 
 				if (startTimestamp >= audioContext.currentTime) {
 					node.start(startTimestamp);
