@@ -8,10 +8,13 @@ import {
 	SARVAM_TTS_SUPPORTED_CODES,
 	toSarvamCode,
 } from "@/constants/sarvam-constants";
+import { computeMuteKeyframes } from "@/lib/timeline/dub-replacement";
+import type { TimeRange } from "@/lib/text-timeline-sync";
 import { toast } from "sonner";
-import type { TranscriptionSegment } from "@/types/ai";
 
 export type DubbingEngine = "sarvam" | "smallest" | "local";
+
+export type DubbingScope = "narrator" | "all";
 
 export interface DubbingOptions {
 	targetLanguage: string;
@@ -19,6 +22,19 @@ export interface DubbingOptions {
 	voiceId: string;
 	pace?: number;
 	segmentIndices?: number[];
+	/**
+	 * Which segments to dub when segmentIndices is not given:
+	 * "narrator" dubs only segments with role === "narrator" (falling back to
+	 * all segments when no roles are assigned); "all" dubs everything.
+	 */
+	scope?: DubbingScope;
+	/**
+	 * Mute the original audio under each dubbed range (default true). Field
+	 * segments and everything outside dubbed ranges keep their original audio.
+	 */
+	replaceOriginal?: boolean;
+	/** Reference audio path for XTTS voice cloning (local engine only). */
+	speakerWav?: string;
 }
 
 export interface DubbingProgress {
@@ -27,6 +43,11 @@ export interface DubbingProgress {
 	currentText: string;
 	phase: "translating" | "generating" | "placing" | "done";
 }
+
+/** Dub may run this much longer than its slot before a speed-up retry. */
+const FIT_TOLERANCE = 1.08;
+/** Upper bound for corrective TTS speed-up — beyond this it sounds rushed. */
+const MAX_FIT_SPEED = 1.35;
 
 function getAudioDuration(url: string): Promise<number> {
 	return new Promise((resolve) => {
@@ -52,10 +73,15 @@ export function useAIDubbing() {
 
 	const runDubbing = useCallback(
 		async (options: DubbingOptions) => {
-			const targetSegments =
-				options.segmentIndices
-					?.map((i) => segments[i])
-					.filter(Boolean) ?? segments;
+			const scope = options.scope ?? "narrator";
+			const narratorSegments = segments.filter(
+				(seg) => seg.role === "narrator",
+			);
+			const targetSegments = options.segmentIndices
+				? options.segmentIndices.map((i) => segments[i]).filter(Boolean)
+				: scope === "narrator" && narratorSegments.length > 0
+					? narratorSegments
+					: segments;
 
 			if (targetSegments.length === 0) {
 				toast.error("No segments to dub");
@@ -74,13 +100,19 @@ export function useAIDubbing() {
 			const totalSegments = targetSegments.length;
 			let completed = 0;
 
+			// Dubs get their own named track so reruns reuse it and the
+			// mute pass can exclude it.
+			const dubTrackName = `Dub (${options.targetLanguage})`;
 			const tracks = editor.timeline.getTracks();
-			let audioTrack = tracks.find((t) => t.type === "audio");
-			let trackId = audioTrack?.id;
-
+			let trackId = tracks.find(
+				(t) => t.type === "audio" && t.name === dubTrackName,
+			)?.id;
 			if (!trackId) {
 				trackId = editor.timeline.addTrack({ type: "audio" });
+				editor.timeline.renameTrack({ trackId, name: dubTrackName });
 			}
+
+			const dubbedRanges: TimeRange[] = [];
 
 			try {
 				for (const seg of targetSegments) {
@@ -121,10 +153,20 @@ export function useAIDubbing() {
 						phase: "generating",
 					});
 
-					let audioBlob: Blob;
 					const isSarvam = options.engine === "sarvam" && isSarvamLang;
 					const isSmallest = options.engine === "smallest";
+					const slotDuration = Math.max(0.2, seg.end - seg.start);
 
+					const generateLocal = async (speed: number): Promise<Blob> =>
+						aiClient.generateSpeechBlob({
+							text: translatedText,
+							language: options.targetLanguage,
+							speaker: options.voiceId,
+							speakerWav: options.speakerWav,
+							speed,
+						});
+
+					let audioBlob: Blob;
 					if (isSarvam) {
 						const sarvamCode =
 							toSarvamCode(options.targetLanguage) ?? "hi-IN";
@@ -142,11 +184,40 @@ export function useAIDubbing() {
 							options.pace ?? 1.0,
 						);
 					} else {
-						audioBlob = await aiClient.generateSpeechBlob({
-							text: translatedText,
-							language: options.targetLanguage,
-							speaker: options.voiceId,
-						});
+						audioBlob = await generateLocal(options.pace ?? 1.0);
+					}
+
+					const ext = isSarvam || isSmallest ? "mp3" : "wav";
+					const mimeType = isSarvam || isSmallest ? "audio/mpeg" : "audio/wav";
+
+					let file = new File([audioBlob], `dub_${generateUUID()}.${ext}`, {
+						type: mimeType,
+					});
+					let audioUrl = URL.createObjectURL(file);
+					let duration = await getAudioDuration(audioUrl);
+
+					// Fit-to-slot: if the dub overflows its slot, retry once at a
+					// proportionally higher speed (local XTTS engine only).
+					if (
+						!isSarvam &&
+						!isSmallest &&
+						duration > slotDuration * FIT_TOLERANCE
+					) {
+						const fitSpeed = Math.min(
+							MAX_FIT_SPEED,
+							(duration / slotDuration) * (options.pace ?? 1.0),
+						);
+						try {
+							const refitBlob = await generateLocal(fitSpeed);
+							URL.revokeObjectURL(audioUrl);
+							file = new File([refitBlob], `dub_${generateUUID()}.${ext}`, {
+								type: mimeType,
+							});
+							audioUrl = URL.createObjectURL(file);
+							duration = await getAudioDuration(audioUrl);
+						} catch {
+							// Keep the first take if the refit attempt fails.
+						}
 					}
 
 					setProgress({
@@ -156,28 +227,25 @@ export function useAIDubbing() {
 						phase: "placing",
 					});
 
-					const ext = isSarvam || isSmallest ? "mp3" : "wav";
-					const mimeType = isSarvam || isSmallest ? "audio/mpeg" : "audio/wav";
-					const file = new File([audioBlob], `dub_${generateUUID()}.${ext}`, {
-						type: mimeType,
-					});
-					const audioUrl = URL.createObjectURL(file);
-					const duration = await getAudioDuration(audioUrl);
-
+					const dubDuration = duration || slotDuration;
 					editor.timeline.insertElement({
-						placement: { mode: "explicit", trackId: trackId! },
+						placement: { mode: "explicit", trackId },
 						element: {
 							type: "audio",
 							sourceType: "library",
 							sourceUrl: audioUrl,
 							name: `Dub [${options.targetLanguage}]: ${seg.text.slice(0, 20)}...`,
 							startTime: seg.start,
-							duration: duration || seg.end - seg.start,
+							duration: dubDuration,
 							trimStart: 0,
 							trimEnd: 0,
-							sourceDuration: duration || seg.end - seg.start,
+							sourceDuration: dubDuration,
 							volume: 1,
 						},
+					});
+					dubbedRanges.push({
+						start: seg.start,
+						end: seg.start + Math.max(dubDuration, slotDuration),
 					});
 
 					completed++;
@@ -190,6 +258,19 @@ export function useAIDubbing() {
 						currentText: translatedText.slice(0, 50),
 						phase: completed === totalSegments ? "done" : "translating",
 					});
+				}
+
+				// Replace, don't layer: silence the original audio exactly under
+				// the dubbed ranges. Field audio outside the ranges is untouched.
+				if (options.replaceOriginal !== false && dubbedRanges.length > 0) {
+					const muteKeyframes = computeMuteKeyframes({
+						tracks: editor.timeline.getTracks(),
+						windows: dubbedRanges,
+						excludeTrackIds: new Set([trackId]),
+					});
+					if (muteKeyframes.length > 0) {
+						editor.timeline.upsertKeyframes({ keyframes: muteKeyframes });
+					}
 				}
 
 				updateTask(taskId, {

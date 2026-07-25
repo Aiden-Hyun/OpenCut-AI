@@ -3,6 +3,7 @@ import type {
 	TranscriptionSegment,
 	EmotionSegment,
 	FillerWord,
+	SegmentRole,
 	SilenceRegion,
 	Chapter,
 } from "@/types/ai";
@@ -61,6 +62,8 @@ interface TranscriptState {
 	applySpeakerDiarization: (
 		speakerSegments: { speaker: string; start: number; end: number }[],
 	) => void;
+	/** Bulk-assign localization roles (narrator/field) by segment id */
+	setSegmentRoles: (roles: Record<number, SegmentRole>) => void;
 	reset: () => void;
 }
 
@@ -228,6 +231,13 @@ export const useTranscriptStore = create<TranscriptState>()((set, get) => ({
 				speakerPositions: defaultPositions,
 			};
 		}),
+
+	setSegmentRoles: (roles) =>
+		set((state) => ({
+			segments: state.segments.map((seg) =>
+				roles[seg.id] !== undefined ? { ...seg, role: roles[seg.id] } : seg,
+			),
+		})),
 
 	reset: () => set({ ...initialState, selectedSegmentIds: new Set<number>() }),
 }));

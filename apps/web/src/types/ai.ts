@@ -6,6 +6,14 @@ export interface TranscriptionWord {
 	confidence: number;
 }
 
+/**
+ * Localization role of a transcript segment.
+ * - "narrator": scripted voiceover — gets dubbed (replaced by TTS) when localizing.
+ * - "field": on-scene audio (bodycam, interviews) — kept in the original
+ *   language and subtitled only.
+ */
+export type SegmentRole = "narrator" | "field";
+
 export interface TranscriptionSegment {
 	id: number;
 	text: string;
@@ -13,6 +21,7 @@ export interface TranscriptionSegment {
 	end: number;
 	words: TranscriptionWord[];
 	speaker?: string;
+	role?: SegmentRole;
 }
 
 export interface TranscriptionResult {
@@ -80,6 +89,8 @@ export interface TTSRequest {
 	language: string;
 	speakerWav?: string;
 	speaker?: string;
+	/** Playback speed multiplier passed to the TTS engine (XTTS: ~0.5–2.0). */
+	speed?: number;
 }
 
 export interface TTSResult {
