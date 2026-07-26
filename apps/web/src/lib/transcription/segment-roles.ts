@@ -20,26 +20,33 @@ interface SpeakerStats {
 /**
  * Proposes narrator/field roles from diarized transcript segments.
  *
- * The narrator of a voiceover-style video is the speaker who (a) talks the
- * most overall, (b) appears spread across the whole timeline rather than in
- * one cluster, and (c) tends to transcribe with higher word confidence
- * (studio audio vs. field audio). Segments from every other speaker — and
- * segments diarization failed to label — are proposed as "field", which is
- * the safe default: a mislabeled field segment would get muted and dubbed,
- * while a mislabeled narrator segment merely keeps its original audio.
+ * A narrator delivers uninterrupted monologue: their segments cluster in
+ * solo blocks (often opening the video), while field speakers interleave in
+ * rapid back-and-forth dialogue. Narration is also studio-quality audio, so
+ * it transcribes with markedly higher word confidence than bodycam speech.
+ * Scoring therefore favors (a) low interleaving with other speakers,
+ * (b) high transcription confidence, (c) speaking time, and (d) opening
+ * the video. Raw duration alone is deliberately NOT decisive — in bodycam
+ * footage the officer often out-talks the narrator.
+ *
+ * Segments from every other speaker — and segments diarization failed to
+ * label — are proposed as "field", the safe default: a mislabeled field
+ * segment would get muted and dubbed, while a mislabeled narrator segment
+ * merely keeps its original audio.
  */
 export function proposeSegmentRoles({
 	segments,
 }: {
 	segments: TranscriptionSegment[];
 }): RoleClassification {
-	const bySpeaker = new Map<string, SpeakerStats>();
-	let timelineStart = Number.POSITIVE_INFINITY;
-	let timelineEnd = Number.NEGATIVE_INFINITY;
+	const ordered = [...segments].sort((a, b) => a.start - b.start);
+	const bySpeaker = new Map<
+		string,
+		SpeakerStats & { neighborCount: number; interleavedCount: number }
+	>();
 
-	for (const segment of segments) {
-		timelineStart = Math.min(timelineStart, segment.start);
-		timelineEnd = Math.max(timelineEnd, segment.end);
+	for (let i = 0; i < ordered.length; i++) {
+		const segment = ordered[i];
 		if (!segment.speaker) continue;
 
 		const stats = bySpeaker.get(segment.speaker) ?? {
@@ -48,6 +55,8 @@ export function proposeSegmentRoles({
 			lastEnd: segment.end,
 			confidenceSum: 0,
 			wordCount: 0,
+			neighborCount: 0,
+			interleavedCount: 0,
 		};
 		stats.totalDuration += Math.max(0, segment.end - segment.start);
 		stats.firstStart = Math.min(stats.firstStart, segment.start);
@@ -56,6 +65,14 @@ export function proposeSegmentRoles({
 			stats.confidenceSum += word.confidence ?? 0;
 			stats.wordCount++;
 		}
+		// Interleaving: how often this speaker's segments border a different
+		// labeled speaker. Dialogue participants alternate constantly; a
+		// narrator's segments sit in contiguous solo blocks.
+		for (const neighbor of [ordered[i - 1], ordered[i + 1]]) {
+			if (!neighbor?.speaker) continue;
+			stats.neighborCount++;
+			if (neighbor.speaker !== segment.speaker) stats.interleavedCount++;
+		}
 		bySpeaker.set(segment.speaker, stats);
 	}
 
@@ -63,17 +80,22 @@ export function proposeSegmentRoles({
 		return { narratorSpeaker: null, roles: {}, confidence: 0 };
 	}
 
-	const timelineSpan = Math.max(timelineEnd - timelineStart, 1e-6);
+	const firstSpeaker = ordered.find((seg) => seg.speaker)?.speaker;
 	const scores = new Map<string, number>();
 	for (const [speaker, stats] of bySpeaker) {
-		const spread = Math.min(
-			1,
-			Math.max(0, (stats.lastEnd - stats.firstStart) / timelineSpan),
-		);
 		const avgConfidence =
 			stats.wordCount > 0 ? stats.confidenceSum / stats.wordCount : 0.5;
+		const interleaveRatio =
+			stats.neighborCount > 0
+				? stats.interleavedCount / stats.neighborCount
+				: 0;
+		// Sub-linear duration so sheer talk time cannot outvote structure.
+		const durationTerm = Math.sqrt(Math.max(stats.totalDuration, 1e-6));
+		const monologueTerm = (1 - interleaveRatio) ** 2;
+		const confidenceTerm = avgConfidence ** 2;
+		const opensVideo = speaker === firstSpeaker ? 1.25 : 1;
 		const score =
-			stats.totalDuration * (0.5 + 0.5 * spread) * (0.75 + 0.25 * avgConfidence);
+			durationTerm * (0.15 + 0.85 * monologueTerm) * (0.25 + 0.75 * confidenceTerm) * opensVideo;
 		scores.set(speaker, score);
 	}
 
