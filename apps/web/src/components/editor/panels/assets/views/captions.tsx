@@ -62,6 +62,11 @@ export function Captions() {
 	const [inpaintProgress, setInpaintProgress] = useState(0);
 	const [inpaintStep, setInpaintStep] = useState("");
 	const [inpaintError, setInpaintError] = useState<string | null>(null);
+	const [inpaintJobId, setInpaintJobId] = useState<string | null>(null);
+	const [isCancellingInpaint, setIsCancellingInpaint] = useState(false);
+	const [isDetectingRegion, setIsDetectingRegion] = useState(false);
+	// Set by the Stop button; the polling loop exits on its next tick.
+	const inpaintStopRequestedRef = useRef(false);
 	const containerRef = useRef<HTMLDivElement>(null);
 	const segments = useTranscriptStore((s) => s.segments);
 	const editor = useEditor();
@@ -699,6 +704,107 @@ export function Captions() {
 		toast.success("Subtitle track removed");
 	};
 
+	/** Resolve the first video media file on the timeline (shared by the
+	 *  auto-detect and Remove handlers), ensuring it has a file extension
+	 *  since the backend rejects files without one. */
+	const resolveTimelineVideoFile = (): { file: File } | { error: string } => {
+		const tracks = editor.timeline.getTracks();
+		let foundMediaId: string | null = null;
+
+		for (const track of tracks) {
+			for (const element of track.elements) {
+				if (track.type === "video" && hasMediaId(element as TimelineElement)) {
+					foundMediaId = (element as TimelineElement & { mediaId: string })
+						.mediaId;
+					break;
+				}
+			}
+			if (foundMediaId) break;
+		}
+
+		if (!foundMediaId) {
+			return { error: "No video found on the timeline. Import a video file first." };
+		}
+
+		const mediaAsset = editor.media
+			.getAssets()
+			.find((asset) => asset.id === foundMediaId);
+
+		if (!mediaAsset?.file) {
+			return { error: "Cannot access the media file for subtitle removal." };
+		}
+
+		let file = mediaAsset.file;
+		const fileName = file.name || "";
+		const hasExtension =
+			fileName.includes(".") && (fileName.split(".").pop() ?? "").length > 0;
+		if (!hasExtension) {
+			const newName = fileName ? `${fileName}.mp4` : "media.mp4";
+			file = new File([file], newName, { type: file.type || "video/mp4" });
+		}
+
+		return { file };
+	};
+
+	const handleDetectRegion = async () => {
+		try {
+			setIsDetectingRegion(true);
+			setInpaintError(null);
+
+			const resolved = resolveTimelineVideoFile();
+			if ("error" in resolved) {
+				setInpaintError(resolved.error);
+				return;
+			}
+
+			const result = await aiClient.detectSubtitleRegion(resolved.file);
+			if (result.found && result.region) {
+				setInpaintRegion({
+					x1: result.region.x1.toFixed(3),
+					y1: result.region.y1.toFixed(3),
+					x2: result.region.x2.toFixed(3),
+					y2: result.region.y2.toFixed(3),
+				});
+				toast.success(
+					`Text band found in ${Math.round(result.hit_ratio * 100)}% of sampled frames — review the box, then Remove`,
+				);
+			} else {
+				toast.error("No recurring text band detected — set the region manually");
+			}
+		} catch (err) {
+			console.error("Region detection failed:", err);
+			const message =
+				err instanceof Error ? err.message : "Region detection failed";
+			if (
+				message.includes("Cannot connect") ||
+				message.includes("connection_refused") ||
+				message.includes("not available")
+			) {
+				setInpaintError(
+					"Cannot connect to the inpaint service. Make sure it is running (docker compose up -d inpaint-service).",
+				);
+			} else {
+				setInpaintError(message);
+			}
+		} finally {
+			setIsDetectingRegion(false);
+		}
+	};
+
+	const handleStopInpaint = async () => {
+		if (!inpaintJobId) return;
+		setIsCancellingInpaint(true);
+		inpaintStopRequestedRef.current = true;
+		setInpaintStep("Cancelling...");
+		try {
+			await aiClient.cancelInpaintJob(inpaintJobId);
+		} catch (err) {
+			// The polling loop still exits via the stop flag; the orphaned
+			// job keeps running server-side at worst.
+			console.warn("Cancel request failed:", err);
+		}
+	};
+
 	const handleRemoveBurnedSubtitles = async () => {
 		const taskId = `inpaint-${Date.now()}`;
 		const bgTasks = useBackgroundTasksStore.getState();
@@ -731,52 +837,17 @@ export function Captions() {
 			setIsInpainting(true);
 			setInpaintError(null);
 			setInpaintProgress(0);
+			inpaintStopRequestedRef.current = false;
 
 			// Find the first video media asset on the timeline (same media
 			// resolution as the transcribe handler, restricted to video)
 			setInpaintStep("Finding media...");
-			const tracks = editor.timeline.getTracks();
-			let foundMediaId: string | null = null;
-
-			for (const track of tracks) {
-				for (const element of track.elements) {
-					if (
-						track.type === "video" &&
-						hasMediaId(element as TimelineElement)
-					) {
-						foundMediaId = (element as TimelineElement & { mediaId: string })
-							.mediaId;
-						break;
-					}
-				}
-				if (foundMediaId) break;
-			}
-
-			if (!foundMediaId) {
-				setInpaintError(
-					"No video found on the timeline. Import a video file first.",
-				);
+			const resolved = resolveTimelineVideoFile();
+			if ("error" in resolved) {
+				setInpaintError(resolved.error);
 				return;
 			}
-
-			const mediaAsset = editor.media
-				.getAssets()
-				.find((asset) => asset.id === foundMediaId);
-
-			if (!mediaAsset?.file) {
-				setInpaintError("Cannot access the media file for subtitle removal.");
-				return;
-			}
-
-			// Ensure the file has a proper extension — the backend rejects files without one
-			let file = mediaAsset.file;
-			const fileName = file.name || "";
-			const hasExtension =
-				fileName.includes(".") && (fileName.split(".").pop() ?? "").length > 0;
-			if (!hasExtension) {
-				const newName = fileName ? `${fileName}.mp4` : "media.mp4";
-				file = new File([file], newName, { type: file.type || "video/mp4" });
-			}
+			const { file } = resolved;
 
 			bgTasks.addTask({
 				id: taskId,
@@ -787,11 +858,17 @@ export function Captions() {
 
 			setInpaintStep("Uploading video...");
 			const { job_id } = await aiClient.removeSubtitles(file, region);
+			setInpaintJobId(job_id);
 
-			// Poll every 3s until the job finishes
+			// Poll every 3s until the job finishes or the user hits Stop
 			let consecutiveFailures = 0;
 			for (;;) {
 				await new Promise((resolve) => setTimeout(resolve, 3000));
+				if (inpaintStopRequestedRef.current) {
+					bgTasks.removeTask(taskId);
+					toast("Subtitle removal cancelled");
+					return;
+				}
 				let status: Awaited<ReturnType<typeof aiClient.inpaintJobStatus>>;
 				try {
 					status = await aiClient.inpaintJobStatus(job_id);
@@ -802,6 +879,11 @@ export function Captions() {
 					continue;
 				}
 
+				if (status.status === "cancelled") {
+					bgTasks.removeTask(taskId);
+					toast("Subtitle removal cancelled");
+					return;
+				}
 				if (status.status === "error") {
 					throw new Error(status.error || "Subtitle removal failed.");
 				}
@@ -874,6 +956,9 @@ export function Captions() {
 			setIsInpainting(false);
 			setInpaintStep("");
 			setInpaintProgress(0);
+			setInpaintJobId(null);
+			setIsCancellingInpaint(false);
+			inpaintStopRequestedRef.current = false;
 		}
 	};
 
@@ -1158,6 +1243,19 @@ export function Captions() {
 						Erase hardcoded subtitles with AI inpainting (STTN). Runs locally.
 					</p>
 
+					<Button
+						variant="outline"
+						size="sm"
+						className="w-full"
+						onClick={handleDetectRegion}
+						disabled={isDetectingRegion || isInpainting}
+					>
+						{isDetectingRegion && <Spinner className="mr-1" />}
+						{isDetectingRegion
+							? "Scanning video for text..."
+							: "Auto-detect region"}
+					</Button>
+
 					<div className="grid grid-cols-2 gap-2">
 						{(
 							[
@@ -1199,19 +1297,35 @@ export function Captions() {
 						</div>
 					)}
 
-					<Button
-						className="w-full"
-						variant="outline"
-						onClick={handleRemoveBurnedSubtitles}
-						disabled={isInpainting}
-					>
-						{isInpainting && <Spinner className="mr-1" />}
-						{isInpainting
-							? `${inpaintStep || "Processing..."}${
-									inpaintProgress > 0 ? ` (${inpaintProgress}%)` : ""
-								}`
-							: "Remove subtitles"}
-					</Button>
+					{isInpainting ? (
+						<div className="flex gap-2">
+							<Button className="min-w-0 flex-1" variant="outline" disabled>
+								<Spinner className="mr-1" />
+								<span className="truncate">
+									{`${inpaintStep || "Processing..."}${
+										inpaintProgress > 0 ? ` (${inpaintProgress}%)` : ""
+									}`}
+								</span>
+							</Button>
+							<Button
+								variant="outline"
+								className="shrink-0 text-destructive hover:text-destructive"
+								onClick={handleStopInpaint}
+								disabled={!inpaintJobId || isCancellingInpaint}
+							>
+								{isCancellingInpaint ? "Stopping..." : "Stop"}
+							</Button>
+						</div>
+					) : (
+						<Button
+							className="w-full"
+							variant="outline"
+							onClick={handleRemoveBurnedSubtitles}
+							disabled={isDetectingRegion}
+						>
+							Remove subtitles
+						</Button>
+					)}
 
 					<p className="text-[10px] text-muted-foreground">
 						CPU processing is slow — expect several minutes per video minute.

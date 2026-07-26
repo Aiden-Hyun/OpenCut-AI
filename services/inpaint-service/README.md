@@ -11,9 +11,18 @@ The STTN implementation is vendored from
 ## API
 
 - `GET /health` — `{status, model: {installed, loaded}}`
+- `POST /detect-region` — multipart `file` →
+  `{found, region: {x1, y1, x2, y2} | null, hit_ratio, frames_sampled}`.
+  Synchronous OpenCV heuristic (no OCR, no weights) that locates the
+  recurring burned-in subtitle band; constant overlays (watermarks/logos)
+  are excluded by their lack of cross-frame content variance, and
+  uniformly busy footage is rejected by a peak-dominance gate.
 - `POST /inpaint` — multipart `file` + form fields `x1, y1, x2, y2`
   (fractions 0-1 of the frame; box containing the subtitles) → `{job_id}`
-- `GET /jobs/{job_id}` — `{status: queued|processing|done|error, progress, message}`
+- `GET /jobs/{job_id}` — `{status: queued|processing|done|error|cancelled, progress, message}`
+- `POST /jobs/{job_id}/cancel` — abort a queued/running job (the worker
+  polls the flag between STTN sliding windows and cleans up its temp
+  files); no-op on finished jobs. Returns the job status.
 - `GET /result/{job_id}` — processed mp4 (H.264, original audio remuxed)
 
 ## Model weights

@@ -2,8 +2,9 @@
 
 Standalone FastAPI service that removes burned-in (hardcoded) subtitles
 from video by inpainting a caller-supplied rectangular region with STTN
-(Spatial-Temporal Transformer Networks). Jobs run in a background thread
-and are polled by id. Runs on port 8427.
+(Spatial-Temporal Transformer Networks). Jobs run in a background thread,
+are polled by id and can be cancelled mid-run. /detect-region suggests the
+subtitle region via a pure-OpenCV heuristic. Runs on port 8427.
 
 Model weights come from the video-subtitle-remover project (Apache-2.0)
 and are lazy-downloaded on first use into ~/.cache.
@@ -21,8 +22,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+
+from detect import detect_subtitle_region
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -59,11 +63,13 @@ ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".w
 @dataclass
 class Job:
     job_id: str
-    status: str = "queued"  # queued | processing | done | error
+    status: str = "queued"  # queued | processing | done | error | cancelled
     progress: float = 0.0
     message: str = ""
     error: str | None = None
     result_path: str | None = None
+    # Set by /jobs/{id}/cancel; polled by the worker between sliding windows.
+    cancel_requested: bool = False
     created_at: float = field(default_factory=time.time)
 
 
@@ -80,6 +86,23 @@ def _update_job(job_id: str, **updates) -> None:
             return
         for key, value in updates.items():
             setattr(job, key, value)
+
+
+def _cancel_requested(job_id: str) -> bool:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        return bool(job and job.cancel_requested)
+
+
+def _job_snapshot(job: Job) -> dict:
+    """Public status shape shared by /jobs/{id} and /jobs/{id}/cancel."""
+    return {
+        "job_id": job.job_id,
+        "status": job.status,
+        "progress": round(job.progress, 4),
+        "message": job.message,
+        "error": job.error,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -197,17 +220,21 @@ def _process_job(
     region: tuple[float, float, float, float],
 ) -> None:
     """Worker thread: download weights, inpaint frames, mux audio."""
+    from sttn.pipeline import InpaintCancelled, inpaint_video
+
     raw_path = os.path.join(RESULT_DIR, f"{job_id}_raw.mp4")
     final_path = os.path.join(RESULT_DIR, f"{job_id}.mp4")
     with _work_lock:
         try:
+            if _cancel_requested(job_id):
+                raise InpaintCancelled("Cancelled while queued.")
             _update_job(job_id, status="processing", progress=0.01, message="Preparing model...")
             inpainter = inpaint_service.get_inpainter(
                 on_status=lambda msg: _update_job(job_id, message=msg)
             )
+            if _cancel_requested(job_id):
+                raise InpaintCancelled("Cancelled while preparing model.")
             _update_job(job_id, progress=0.05, message="Inpainting frames...")
-
-            from sttn.pipeline import inpaint_video
 
             def on_progress(done: int, total: int) -> None:
                 _update_job(
@@ -217,8 +244,13 @@ def _process_job(
                 )
 
             start = time.time()
-            frames = inpaint_video(inpainter, input_path, raw_path, region, on_progress)
+            frames = inpaint_video(
+                inpainter, input_path, raw_path, region, on_progress,
+                should_cancel=lambda: _cancel_requested(job_id),
+            )
 
+            if _cancel_requested(job_id):
+                raise InpaintCancelled("Cancelled before encoding.")
             _update_job(job_id, progress=0.92, message="Encoding output video...")
             _mux_output(raw_path, input_path, final_path)
 
@@ -231,10 +263,15 @@ def _process_job(
                 message=f"Done: {frames} frames in {elapsed:.0f}s",
                 result_path=final_path,
             )
+        except InpaintCancelled:
+            logger.info("Inpaint job %s cancelled", job_id)
+            _update_job(job_id, status="cancelled", message="Cancelled")
         except Exception as e:
             logger.exception("Inpaint job %s failed", job_id)
             _update_job(job_id, status="error", error=str(e)[:500], message="Failed")
         finally:
+            # Drop the input and any partial output so cancelled/failed jobs
+            # leave nothing behind; only a completed final_path survives.
             for path in (raw_path, input_path):
                 if os.path.exists(path):
                     os.remove(path)
@@ -271,6 +308,55 @@ async def health():
             "model_name": "sttn",
         },
     }
+
+
+@app.post("/detect-region")
+async def detect_region(file: UploadFile = File(...)):
+    """Detect the burned-in subtitle region of the uploaded video.
+
+    Synchronous (no job): samples ~24 frames and returns the strongest
+    recurring text band as fractions (0-1) of the frame, ready to feed
+    into /inpaint. Pure OpenCV heuristic — no OCR, no model weights.
+    Response: {found, region: {x1, y1, x2, y2} | null, hit_ratio,
+    frames_sampled}.
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided.")
+
+    ext = Path(file.filename).suffix.lower()
+    if ext not in ALLOWED_VIDEO_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}'. Allowed: {sorted(ALLOWED_VIDEO_EXTENSIONS)}",
+        )
+
+    detect_id = uuid.uuid4().hex[:12]
+    input_path = os.path.join(UPLOAD_DIR, f"detect_{detect_id}{ext}")
+    try:
+        contents = await file.read()
+        with open(input_path, "wb") as f:
+            f.write(contents)
+    except Exception:
+        logger.exception("Failed to store upload for detection %s", detect_id)
+        raise HTTPException(status_code=500, detail="Failed to store upload.")
+
+    try:
+        # CPU-bound OpenCV work; keep the event loop free.
+        result = await run_in_threadpool(detect_subtitle_region, input_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("Region detection %s failed", detect_id)
+        raise HTTPException(status_code=500, detail="Region detection failed.")
+    finally:
+        if os.path.exists(input_path):
+            os.remove(input_path)
+
+    logger.info(
+        "Region detection %s (%s): found=%s hit_ratio=%.3f",
+        detect_id, file.filename, result["found"], result["hit_ratio"],
+    )
+    return result
 
 
 @app.post("/inpaint")
@@ -332,18 +418,39 @@ async def inpaint(
 
 @app.get("/jobs/{job_id}")
 async def job_status(job_id: str):
-    """Poll job status: queued | processing | done | error, progress 0-1."""
+    """Poll job status: queued | processing | done | error | cancelled, progress 0-1."""
     with _jobs_lock:
         job = _jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found.")
-    return {
-        "job_id": job.job_id,
-        "status": job.status,
-        "progress": round(job.progress, 4),
-        "message": job.message,
-        "error": job.error,
-    }
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found.")
+        return _job_snapshot(job)
+
+
+@app.post("/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    """Request cancellation of a queued or running inpaint job.
+
+    Sets a flag that the worker polls between STTN sliding windows, so a
+    processing job aborts within a few seconds, frees the worker lock and
+    removes its temp files. A still-queued job is cancelled immediately.
+    Cancelling a done/errored/cancelled job is a no-op that returns the
+    current status.
+    """
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found.")
+        if job.status in ("queued", "processing"):
+            job.cancel_requested = True
+            if job.status == "queued":
+                # The worker has not picked it up yet; it will observe the
+                # flag when it does and clean up the stored upload.
+                job.status = "cancelled"
+                job.message = "Cancelled"
+            else:
+                job.message = "Cancelling..."
+            logger.info("Cancel requested for inpaint job %s", job_id)
+        return _job_snapshot(job)
 
 
 @app.get("/result/{job_id}")

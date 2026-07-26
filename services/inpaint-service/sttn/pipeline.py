@@ -34,6 +34,10 @@ MODEL_INPUT_WIDTH = 640
 MODEL_INPUT_HEIGHT = 120
 
 
+class InpaintCancelled(Exception):
+    """Raised to abort inpaint_video when the caller requests cancellation."""
+
+
 class STTNInpaint:
     """Wraps the pretrained STTN generator for band-wise video inpainting."""
 
@@ -145,12 +149,16 @@ def inpaint_video(
     output_path: str,
     region: tuple[float, float, float, float],
     on_progress: Callable[[int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> int:
     """Remove the given region from a video by STTN inpainting.
 
     :param region: (x1, y1, x2, y2) as fractions (0-1) of the frame
     :param on_progress: callback(frames_done, total_frames)
+    :param should_cancel: polled between chunks and between sliding
+        windows; return True to abort promptly via InpaintCancelled
     :returns: number of frames written
+    :raises InpaintCancelled: when should_cancel() turns True
     """
     reader = cv2.VideoCapture(input_path)
     if not reader.isOpened():
@@ -192,6 +200,8 @@ def inpaint_video(
     frames_done = 0
     try:
         while True:
+            if should_cancel and should_cancel():
+                raise InpaintCancelled("Cancelled between chunks.")
             # Read the next chunk of frames
             frames_hr: list[np.ndarray] = []
             while len(frames_hr) < MAX_LOAD_NUM:
@@ -214,7 +224,14 @@ def inpaint_video(
                 ]
 
                 def window_cb(done_windows: int, total_windows: int, band_index: int = k) -> None:
-                    """Report fine-grained progress while a chunk is inpainted."""
+                    """Report fine-grained progress while a chunk is inpainted.
+
+                    Also the cancellation point: STTNInpaint.inpaint calls this
+                    after every sliding window, so a cancel takes effect within
+                    seconds instead of waiting out the whole chunk.
+                    """
+                    if should_cancel and should_cancel():
+                        raise InpaintCancelled("Cancelled between sliding windows.")
                     if not on_progress:
                         return
                     chunk_fraction = (band_index + done_windows / total_windows) / len(bands)

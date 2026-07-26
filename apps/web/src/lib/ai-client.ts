@@ -72,10 +72,18 @@ const UPLOAD_TIMEOUT_MS = 600_000; // 10 min — large video uploads
 
 export interface InpaintJobStatus {
 	job_id: string;
-	status: "queued" | "processing" | "done" | "error";
+	status: "queued" | "processing" | "done" | "error" | "cancelled";
 	progress: number;
 	message?: string;
 	error?: string | null;
+}
+
+export interface SubtitleRegionDetection {
+	found: boolean;
+	region: { x1: number; y1: number; x2: number; y2: number } | null;
+	/** Fraction of sampled frames with text inside the detected band. */
+	hit_ratio: number;
+	frames_sampled: number;
 }
 
 export class AIClientError extends Error {
@@ -525,10 +533,31 @@ class AIClient {
 		);
 	}
 
+	/** Detect the burned-in subtitle region of a video (synchronous).
+	 *  Coordinates in the result are fractions (0-1) of the frame. */
+	async detectSubtitleRegion(file: File): Promise<SubtitleRegionDetection> {
+		const formData = new FormData();
+		formData.append("file", file);
+
+		return this.requestFormData<SubtitleRegionDetection>(
+			"/api/inpaint/detect-region",
+			formData,
+			UPLOAD_TIMEOUT_MS,
+		);
+	}
+
 	/** Poll the status of an inpaint job. */
 	async inpaintJobStatus(jobId: string): Promise<InpaintJobStatus> {
 		return this.request<InpaintJobStatus>(
 			`/api/inpaint/jobs/${encodeURIComponent(jobId)}`,
+		);
+	}
+
+	/** Request cancellation of a queued/running inpaint job. */
+	async cancelInpaintJob(jobId: string): Promise<InpaintJobStatus> {
+		return this.request<InpaintJobStatus>(
+			`/api/inpaint/jobs/${encodeURIComponent(jobId)}/cancel`,
+			{ method: "POST" },
 		);
 	}
 

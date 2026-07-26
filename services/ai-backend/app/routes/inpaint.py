@@ -1,8 +1,9 @@
 """REST routes for burned-in subtitle removal (STTN video inpainting).
 
 Proxies requests to the inpaint-service microservice. Jobs are long-running
-background tasks on the service side; the frontend polls /jobs/{job_id}
-and downloads the processed video from /result/{job_id}.
+background tasks on the service side; the frontend polls /jobs/{job_id},
+can abort via /jobs/{job_id}/cancel, and downloads the processed video from
+/result/{job_id}. /detect-region synchronously suggests the subtitle box.
 """
 
 import logging
@@ -20,6 +21,8 @@ router = APIRouter(prefix="/api/inpaint", tags=["inpaint"])
 # Uploads can be large and CPU inpainting is slow; be generous.
 UPLOAD_TIMEOUT = httpx.Timeout(600.0, connect=10.0)
 RESULT_TIMEOUT = httpx.Timeout(600.0, connect=10.0)
+# Region detection is synchronous on the service side (~seconds).
+DETECT_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
 
 
 def _service_unavailable() -> HTTPException:
@@ -28,6 +31,34 @@ def _service_unavailable() -> HTTPException:
         detail="Inpaint service is not available. Ensure inpaint-service is running on "
         f"{settings.INPAINT_SERVICE_URL}",
     )
+
+
+@router.post("/detect-region")
+async def detect_region(file: UploadFile = File(...)):
+    """Detect the burned-in subtitle region in a video.
+
+    Synchronous passthrough to the inpaint service's OpenCV heuristic.
+    Returns {found, region: {x1, y1, x2, y2} | null, hit_ratio,
+    frames_sampled} with coordinates as fractions (0-1) of the frame.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=DETECT_TIMEOUT) as client:
+            files = {"file": (file.filename, await file.read(), file.content_type)}
+            resp = await client.post(
+                f"{settings.INPAINT_SERVICE_URL}/detect-region", files=files
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as e:
+        detail = e.response.text if e.response else str(e)
+        raise HTTPException(status_code=e.response.status_code, detail=detail)
+    except httpx.ConnectError:
+        raise _service_unavailable()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Region detection proxy failed")
+        raise HTTPException(status_code=500, detail="Region detection failed.")
 
 
 @router.post("/remove-subtitles")
@@ -82,6 +113,28 @@ async def job_status(job_id: str):
     except Exception:
         logger.exception("Inpaint status proxy failed")
         raise HTTPException(status_code=500, detail="Failed to fetch job status.")
+
+
+@router.post("/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    """Request cancellation of an inpaint job (no-op if already finished)."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{settings.INPAINT_SERVICE_URL}/jobs/{job_id}/cancel"
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as e:
+        detail = e.response.text if e.response else str(e)
+        raise HTTPException(status_code=e.response.status_code, detail=detail)
+    except httpx.ConnectError:
+        raise _service_unavailable()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Inpaint cancel proxy failed")
+        raise HTTPException(status_code=500, detail="Failed to cancel job.")
 
 
 @router.get("/result/{job_id}")
