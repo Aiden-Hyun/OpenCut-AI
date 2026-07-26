@@ -20,7 +20,8 @@ export interface BackgroundTask {
 		| "broll-batch"
 		| "smart-cut"
 		| "proxy-generation"
-		| "dubbing";
+		| "dubbing"
+		| "inpaint";
 	label: string;
 	status: BackgroundTaskStatus;
 	progress: string;

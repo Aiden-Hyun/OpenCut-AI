@@ -87,6 +87,7 @@ services:
       - OPENCUTAI_FACE_SERVICE_URL=http://face-service:8425
       - OPENCUTAI_TURBOQUANT_SERVICE_URL=http://turboquant-service:8430
       - OPENCUTAI_CLIP_SERVICE_URL=http://clip-service:8426
+      - OPENCUTAI_INPAINT_SERVICE_URL=http://inpaint-service:8427
       - OPENCUTAI_AI_MEMORY_BUDGET=${AI_MEMORY_BUDGET:-auto}
       - OPENCUTAI_AI_MODEL_TIER=${AI_MODEL_TIER:-auto}
       - OPENCUTAI_KV_CACHE_BITS=${KV_CACHE_BITS:-4}
@@ -221,6 +222,22 @@ services:
       # First start must download ~340MB of CLIP weights.
       start_period: 60s
 
+  inpaint-service:
+    build:
+      context: ./services/inpaint-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8427:8427"
+    volumes:
+      - inpaint_models:/root/.cache
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8427/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+
   turboquant-service:
     build:
       context: ./services/turboquant-service
@@ -312,6 +329,7 @@ volumes:
   turboquant_models:
   image_generated:
   clip_models:
+  inpaint_models:
 
 networks:
   default:

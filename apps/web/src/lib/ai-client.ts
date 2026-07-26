@@ -68,6 +68,15 @@ export interface ServicesStatus {
 const HEALTH_TIMEOUT_MS = 5_000;
 const REQUEST_TIMEOUT_MS = 120_000;
 const LLM_TIMEOUT_MS = 600_000; // 10 min — LLM generation can be slow on CPU
+const UPLOAD_TIMEOUT_MS = 600_000; // 10 min — large video uploads
+
+export interface InpaintJobStatus {
+	job_id: string;
+	status: "queued" | "processing" | "done" | "error";
+	progress: number;
+	message?: string;
+	error?: string | null;
+}
 
 export class AIClientError extends Error {
 	readonly errorType: AIErrorType;
@@ -494,6 +503,38 @@ class AIClient {
 			"/api/transcribe",
 			formData,
 		);
+	}
+
+	/** Start a burned-in subtitle removal (STTN inpainting) job.
+	 *  Region coordinates are fractions (0-1) of the frame. */
+	async removeSubtitles(
+		file: File,
+		region: { x1: number; y1: number; x2: number; y2: number },
+	): Promise<{ job_id: string }> {
+		const formData = new FormData();
+		formData.append("file", file);
+		formData.append("x1", region.x1.toString());
+		formData.append("y1", region.y1.toString());
+		formData.append("x2", region.x2.toString());
+		formData.append("y2", region.y2.toString());
+
+		return this.requestFormData<{ job_id: string }>(
+			"/api/inpaint/remove-subtitles",
+			formData,
+			UPLOAD_TIMEOUT_MS,
+		);
+	}
+
+	/** Poll the status of an inpaint job. */
+	async inpaintJobStatus(jobId: string): Promise<InpaintJobStatus> {
+		return this.request<InpaintJobStatus>(
+			`/api/inpaint/jobs/${encodeURIComponent(jobId)}`,
+		);
+	}
+
+	/** URL of the processed video for a completed inpaint job. */
+	inpaintResultUrl(jobId: string): string {
+		return `${this.baseUrl}/api/inpaint/result/${encodeURIComponent(jobId)}`;
 	}
 
 	async analyzeFillers(

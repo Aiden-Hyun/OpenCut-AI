@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     TURBOQUANT_SERVICE_URL: str = "http://localhost:8430"
     # CLIP embedding service — powers privacy-first semantic media search
     CLIP_SERVICE_URL: str = "http://localhost:8426"
+    # STTN video inpainting service — removes burned-in subtitles
+    INPAINT_SERVICE_URL: str = "http://localhost:8427"
 
     # Sarvam AI (Indian language APIs)
     SARVAM_API_KEY: str = ""

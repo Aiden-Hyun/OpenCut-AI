@@ -24,10 +24,12 @@ import { SMALLEST_STT_LANGUAGES } from "@/constants/smallest-constants";
 import type { TranscriptionLanguage, TranscriptionEngine } from "@/types/transcription";
 
 import { Spinner } from "@/components/ui/spinner";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { useTranscriptStore } from "@/stores/transcript-store";
 import { getElementsAtTime, hasMediaId } from "@/lib/timeline";
+import { processMediaAssets } from "@/lib/media/processing";
 import { toast } from "sonner";
 import { aiClient } from "@/lib/ai-client";
 import type { TimelineElement } from "@/types/timeline";
@@ -50,6 +52,16 @@ export function Captions() {
 	const [translateLanguage, setTranslateLanguage] = useState("es");
 	const [isTranslating, setIsTranslating] = useState(false);
 	const [translatingStep, setTranslatingStep] = useState("");
+	const [inpaintRegion, setInpaintRegion] = useState({
+		x1: "0.05",
+		y1: "0.75",
+		x2: "0.95",
+		y2: "0.98",
+	});
+	const [isInpainting, setIsInpainting] = useState(false);
+	const [inpaintProgress, setInpaintProgress] = useState(0);
+	const [inpaintStep, setInpaintStep] = useState("");
+	const [inpaintError, setInpaintError] = useState<string | null>(null);
 	const containerRef = useRef<HTMLDivElement>(null);
 	const segments = useTranscriptStore((s) => s.segments);
 	const editor = useEditor();
@@ -687,6 +699,184 @@ export function Captions() {
 		toast.success("Subtitle track removed");
 	};
 
+	const handleRemoveBurnedSubtitles = async () => {
+		const taskId = `inpaint-${Date.now()}`;
+		const bgTasks = useBackgroundTasksStore.getState();
+
+		// Validate the region inputs
+		const region = {
+			x1: Number.parseFloat(inpaintRegion.x1),
+			y1: Number.parseFloat(inpaintRegion.y1),
+			x2: Number.parseFloat(inpaintRegion.x2),
+			y2: Number.parseFloat(inpaintRegion.y2),
+		};
+		if (
+			[region.x1, region.y1, region.x2, region.y2].some((v) =>
+				Number.isNaN(v),
+			) ||
+			region.x1 < 0 ||
+			region.x2 > 1 ||
+			region.x1 >= region.x2 ||
+			region.y1 < 0 ||
+			region.y2 > 1 ||
+			region.y1 >= region.y2
+		) {
+			setInpaintError(
+				"Region values must be fractions between 0 and 1, with x1 < x2 and y1 < y2.",
+			);
+			return;
+		}
+
+		try {
+			setIsInpainting(true);
+			setInpaintError(null);
+			setInpaintProgress(0);
+
+			// Find the first video media asset on the timeline (same media
+			// resolution as the transcribe handler, restricted to video)
+			setInpaintStep("Finding media...");
+			const tracks = editor.timeline.getTracks();
+			let foundMediaId: string | null = null;
+
+			for (const track of tracks) {
+				for (const element of track.elements) {
+					if (
+						track.type === "video" &&
+						hasMediaId(element as TimelineElement)
+					) {
+						foundMediaId = (element as TimelineElement & { mediaId: string })
+							.mediaId;
+						break;
+					}
+				}
+				if (foundMediaId) break;
+			}
+
+			if (!foundMediaId) {
+				setInpaintError(
+					"No video found on the timeline. Import a video file first.",
+				);
+				return;
+			}
+
+			const mediaAsset = editor.media
+				.getAssets()
+				.find((asset) => asset.id === foundMediaId);
+
+			if (!mediaAsset?.file) {
+				setInpaintError("Cannot access the media file for subtitle removal.");
+				return;
+			}
+
+			// Ensure the file has a proper extension — the backend rejects files without one
+			let file = mediaAsset.file;
+			const fileName = file.name || "";
+			const hasExtension =
+				fileName.includes(".") && (fileName.split(".").pop() ?? "").length > 0;
+			if (!hasExtension) {
+				const newName = fileName ? `${fileName}.mp4` : "media.mp4";
+				file = new File([file], newName, { type: file.type || "video/mp4" });
+			}
+
+			bgTasks.addTask({
+				id: taskId,
+				type: "inpaint",
+				label: "Remove burned-in subtitles (STTN)",
+				progress: "Uploading...",
+			});
+
+			setInpaintStep("Uploading video...");
+			const { job_id } = await aiClient.removeSubtitles(file, region);
+
+			// Poll every 3s until the job finishes
+			let consecutiveFailures = 0;
+			for (;;) {
+				await new Promise((resolve) => setTimeout(resolve, 3000));
+				let status: Awaited<ReturnType<typeof aiClient.inpaintJobStatus>>;
+				try {
+					status = await aiClient.inpaintJobStatus(job_id);
+					consecutiveFailures = 0;
+				} catch (pollError) {
+					consecutiveFailures++;
+					if (consecutiveFailures >= 5) throw pollError;
+					continue;
+				}
+
+				if (status.status === "error") {
+					throw new Error(status.error || "Subtitle removal failed.");
+				}
+
+				const percent = Math.round((status.progress ?? 0) * 100);
+				setInpaintProgress(percent);
+				const stepText = status.message || `Processing... ${percent}%`;
+				setInpaintStep(stepText);
+				bgTasks.updateTask(taskId, { progress: `${percent}% — ${stepText}` });
+
+				if (status.status === "done") break;
+			}
+
+			// Download the cleaned video and import it into the media panel
+			setInpaintStep("Importing result...");
+			bgTasks.updateTask(taskId, { progress: "Importing result..." });
+			const response = await fetch(aiClient.inpaintResultUrl(job_id));
+			if (!response.ok) {
+				throw new Error(`Failed to download result (${response.status})`);
+			}
+			const blob = await response.blob();
+			const baseName = file.name.replace(/\.[^.]+$/, "");
+			const resultFile = new File([blob], `${baseName}-clean.mp4`, {
+				type: "video/mp4",
+			});
+
+			const activeProject = editor.project.getActive();
+			const processedAssets = await processMediaAssets({
+				files: [resultFile],
+			});
+			if (processedAssets.length === 0) {
+				throw new Error("Failed to process the cleaned video.");
+			}
+			for (const asset of processedAssets) {
+				await editor.media.addMediaAsset({
+					projectId: activeProject.metadata.id,
+					asset,
+				});
+			}
+
+			toast.success("Burned-in subtitles removed", {
+				description: `${resultFile.name} added to your media.`,
+			});
+			bgTasks.updateTask(taskId, {
+				status: "completed",
+				progress: resultFile.name,
+				completedAt: Date.now(),
+			});
+		} catch (err) {
+			console.error("Subtitle removal failed:", err);
+			const message =
+				err instanceof Error ? err.message : "An unexpected error occurred";
+			if (
+				message.includes("Cannot connect") ||
+				message.includes("connection_refused") ||
+				message.includes("not available")
+			) {
+				setInpaintError(
+					"Cannot connect to the inpaint service. Make sure it is running (docker compose up -d inpaint-service).",
+				);
+			} else {
+				setInpaintError(message);
+			}
+			bgTasks.updateTask(taskId, {
+				status: "error",
+				error: message,
+				completedAt: Date.now(),
+			});
+		} finally {
+			setIsInpainting(false);
+			setInpaintStep("");
+			setInpaintProgress(0);
+		}
+	};
+
 	const handleLanguageChange = ({ value }: { value: string }) => {
 		if (value === "auto") {
 			setSelectedLanguage("auto");
@@ -960,6 +1150,73 @@ export function Captions() {
 						</div>
 					</>
 				)}
+
+				{/* ── Burned-in Subtitles ── */}
+				<div className="border-t pt-4 flex flex-col gap-3">
+					<Label className="text-xs">Burned-in subtitles</Label>
+					<p className="text-[11px] text-muted-foreground leading-relaxed">
+						Erase hardcoded subtitles with AI inpainting (STTN). Runs locally.
+					</p>
+
+					<div className="grid grid-cols-2 gap-2">
+						{(
+							[
+								["x1", "Left (x1)"],
+								["y1", "Top (y1)"],
+								["x2", "Right (x2)"],
+								["y2", "Bottom (y2)"],
+							] as const
+						).map(([key, label]) => (
+							<div key={key} className="flex flex-col gap-1">
+								<Label
+									className="text-[10px] text-muted-foreground"
+									htmlFor={`inpaint-${key}`}
+								>
+									{label}
+								</Label>
+								<Input
+									id={`inpaint-${key}`}
+									type="number"
+									min={0}
+									max={1}
+									step={0.01}
+									value={inpaintRegion[key]}
+									disabled={isInpainting}
+									onChange={(e) =>
+										setInpaintRegion((prev) => ({
+											...prev,
+											[key]: e.target.value,
+										}))
+									}
+								/>
+							</div>
+						))}
+					</div>
+
+					{inpaintError && (
+						<div className="bg-destructive/10 border-destructive/20 rounded-md border p-3">
+							<p className="text-destructive text-sm">{inpaintError}</p>
+						</div>
+					)}
+
+					<Button
+						className="w-full"
+						variant="outline"
+						onClick={handleRemoveBurnedSubtitles}
+						disabled={isInpainting}
+					>
+						{isInpainting && <Spinner className="mr-1" />}
+						{isInpainting
+							? `${inpaintStep || "Processing..."}${
+									inpaintProgress > 0 ? ` (${inpaintProgress}%)` : ""
+								}`
+							: "Remove subtitles"}
+					</Button>
+
+					<p className="text-[10px] text-muted-foreground">
+						CPU processing is slow — expect several minutes per video minute.
+					</p>
+				</div>
 			</div>
 		</PanelView>
 	);
