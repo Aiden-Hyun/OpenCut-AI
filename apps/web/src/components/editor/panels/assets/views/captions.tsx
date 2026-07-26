@@ -25,6 +25,7 @@ import type { TranscriptionLanguage, TranscriptionEngine } from "@/types/transcr
 
 import { Spinner } from "@/components/ui/spinner";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { useTranscriptStore } from "@/stores/transcript-store";
 import { getElementsAtTime, hasMediaId } from "@/lib/timeline";
 import { toast } from "sonner";
@@ -45,6 +46,7 @@ export function Captions() {
 	const [processingStep, setProcessingStep] = useState("");
 	const [error, setError] = useState<string | null>(null);
 	const [subtitleTracks, setSubtitleTracks] = useState<SubtitleTrackInfo[]>([]);
+	const [splitOnTranscribe, setSplitOnTranscribe] = useState(false);
 	const [translateLanguage, setTranslateLanguage] = useState("es");
 	const [isTranslating, setIsTranslating] = useState(false);
 	const [translatingStep, setTranslatingStep] = useState("");
@@ -289,8 +291,10 @@ export function Captions() {
 				useTranscriptStore.getState().setEmotions(emotionResult.emotions);
 			}
 
-			// Split video at segment boundaries AND speaker change points
-			if (validSegments.length > 1) {
+			// Split video at segment boundaries AND speaker change points.
+			// Opt-in: on longer real-world videos this produces 100+ synchronous
+			// splits (each with a full timeline re-render) and freezes the tab.
+			if (splitOnTranscribe && validSegments.length > 1) {
 				try {
 					const allTimes = new Set<number>();
 					for (const seg of validSegments) {
@@ -332,8 +336,12 @@ export function Captions() {
 				}
 			}
 
-			// Auto-separate audio from video so it appears as its own track
-			const tracksAfterSplit = editor.timeline.getTracks();
+			// Auto-separate audio from video so it appears as its own track.
+			// Tied to the split toggle: mutating the timeline mid-flow is only
+			// needed for the text-based-editing workflow.
+			const tracksAfterSplit = splitOnTranscribe
+				? editor.timeline.getTracks()
+				: [];
 			for (const track of tracksAfterSplit) {
 				if (track.type !== "video") continue;
 				for (const el of track.elements) {
@@ -784,6 +792,22 @@ export function Captions() {
 						Transcript is ready. Add subtitles below, or re-transcribe if the video changed.
 					</p>
 				)}
+
+				<div className="flex items-center justify-between gap-2">
+					<div className="flex flex-col">
+						<Label className="text-xs" htmlFor="split-on-transcribe">
+							Split clips at segment boundaries
+						</Label>
+						<span className="text-[10px] text-muted-foreground">
+							For text-based editing. Slow on long videos.
+						</span>
+					</div>
+					<Switch
+						id="split-on-transcribe"
+						checked={splitOnTranscribe}
+						onCheckedChange={setSplitOnTranscribe}
+					/>
+				</div>
 
 				<Button
 					className="w-full"
