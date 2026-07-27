@@ -1,0 +1,73 @@
+# Standalone stack for a rented remote GPU host (RunPod / Lambda / any
+# Ubuntu box with an NVIDIA GPU). Runs ONLY the two compute-heavy services
+# — tts-service (XTTS) and inpaint-service (STTN) — built with CUDA torch
+# wheels via the TORCH_VARIANT build arg. This is NOT an override of
+# docker-compose.yml; use it on its own.
+#
+# Security: these services have no authentication, so ports bind to
+# 127.0.0.1 on the GPU host only. Reach them from your Mac through an SSH
+# tunnel (scripts/remote-gpu.sh tunnel <ssh-host>). Never expose them
+# publicly.
+#
+# Usage (on the GPU host):
+#   docker compose -f docker-compose.gpu-host.yml up -d --build
+#
+# Requirements:
+#   - NVIDIA driver + nvidia-container-toolkit installed on the host
+#   - Docker Compose v2.3+
+services:
+  tts-service:
+    build:
+      context: ./services/tts-service
+      dockerfile: Dockerfile
+      args:
+        TORCH_VARIANT: cu121
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8422:8422"
+    volumes:
+      - tts_models:/root/.cache
+    environment:
+      - TTS_AUTOLOAD=true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8422/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  inpaint-service:
+    build:
+      context: ./services/inpaint-service
+      dockerfile: Dockerfile
+      args:
+        TORCH_VARIANT: cu121
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8427:8427"
+    volumes:
+      - inpaint_models:/root/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8427/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  tts_models:
+  inpaint_models:

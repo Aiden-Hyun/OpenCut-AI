@@ -1,0 +1,16 @@
+# Remote-GPU override for the LOCAL stack: points ai-backend at a remote
+# GPU host's tts-service and inpaint-service through an SSH tunnel instead
+# of the local CPU containers. The tunnel ports are 1-prefixed (18422,
+# 18427) so the local tts/inpaint containers can keep running on 8422/8427.
+#
+# Usage (after `scripts/remote-gpu.sh tunnel <ssh-host>` is up):
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml \
+#     -f docker-compose.remote-gpu.yml up -d --no-deps ai-backend
+# Or simply:
+#   scripts/remote-gpu.sh on     # flip to remote
+#   scripts/remote-gpu.sh off    # flip back to local
+services:
+  ai-backend:
+    environment:
+      - OPENCUTAI_TTS_SERVICE_URL=http://host.docker.internal:18422
+      - OPENCUTAI_INPAINT_SERVICE_URL=http://host.docker.internal:18427

@@ -49,11 +49,24 @@ MODEL_URL = os.getenv(
 )
 MODEL_MIN_BYTES = 60_000_000  # sanity check: real checkpoint is ~66 MB
 DOWNLOAD_ATTEMPTS = int(os.getenv("STTN_DOWNLOAD_ATTEMPTS", "5"))
+# Torch device for STTN inference: auto (CUDA when available, else CPU),
+# or force with DEVICE=cpu / DEVICE=cuda — same convention as the other
+# compute services (clip-service, turboquant-service).
+DEVICE = os.getenv("DEVICE", "auto")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(RESULT_DIR, exist_ok=True)
 
 ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv"}
+
+
+def _resolve_device() -> str:
+    """Pick the torch device for STTN: DEVICE env wins, else auto-detect."""
+    if DEVICE != "auto":
+        return DEVICE
+    import torch
+
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 # ---------------------------------------------------------------------------
 # Job store (in-memory; jobs are ephemeral like the container filesystem)
@@ -133,6 +146,13 @@ class InpaintService:
     def is_loaded(self) -> bool:
         return self._inpainter is not None
 
+    @property
+    def device(self) -> str | None:
+        """Device the STTN model runs on, or None before first load."""
+        if self._inpainter is None:
+            return None
+        return str(self._inpainter.device)
+
     def download_weights(self, on_status=None) -> None:
         """Download the STTN checkpoint with retries (DNS can be flaky in the VM)."""
         if self.is_installed:
@@ -178,9 +198,10 @@ class InpaintService:
                 on_status("Loading STTN model...")
             from sttn.pipeline import STTNInpaint
 
-            logger.info("Loading STTN model from %s...", MODEL_PATH)
-            self._inpainter = STTNInpaint(MODEL_PATH, device="cpu")
-            logger.info("STTN model loaded.")
+            device = _resolve_device()
+            logger.info("Loading STTN model from %s on %s...", MODEL_PATH, device)
+            self._inpainter = STTNInpaint(MODEL_PATH, device=device)
+            logger.info("STTN model loaded on %s.", device)
             return self._inpainter
 
 
@@ -306,6 +327,7 @@ async def health():
             "installed": inpaint_service.is_installed,
             "loaded": inpaint_service.is_loaded,
             "model_name": "sttn",
+            "device": inpaint_service.device,
         },
     }
 

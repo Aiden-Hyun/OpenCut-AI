@@ -23,6 +23,22 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         -r requirements.txt ; \
     fi
 
+# GPU builds: swap the CPU torch wheel for the CUDA variant at the same
+# pinned version (requirements.lock stays the single source of truth).
+# TORCH_VARIANT selects the PyTorch wheel index: cpu (default) or a CUDA
+# tag such as cu121. Runs after the lockfile install so the CPU image
+# layers stay cached and unchanged for cpu builds.
+ARG TORCH_VARIANT=cpu
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cache/pip \
+    if [ "$TORCH_VARIANT" != "cpu" ]; then \
+      uv pip install --system \
+        --index-strategy unsafe-best-match \
+        --index-url "https://download.pytorch.org/whl/${TORCH_VARIANT}" \
+        --extra-index-url https://pypi.org/simple \
+        $(grep -E '^torch==' requirements.lock) ; \
+    fi
+
 COPY . .
 
 RUN mkdir -p uploads results
