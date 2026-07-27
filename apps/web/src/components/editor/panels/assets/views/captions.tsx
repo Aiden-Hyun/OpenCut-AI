@@ -9,7 +9,7 @@ import {
 	SelectTrigger,
 	SelectValue,
 } from "@/components/ui/select";
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { useEditor } from "@/hooks/use-editor";
 import { DEFAULT_TEXT_ELEMENT } from "@/constants/text-constants";
 import { WHISPER_LANGUAGES } from "@/constants/transcription-constants";
@@ -28,6 +28,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { useTranscriptStore } from "@/stores/transcript-store";
+import { usePreviewStore } from "@/stores/preview-store";
 import { getElementsAtTime, hasMediaId } from "@/lib/timeline";
 import { processMediaAssets } from "@/lib/media/processing";
 import { toast } from "sonner";
@@ -58,6 +59,7 @@ export function Captions() {
 		x2: "0.95",
 		y2: "0.98",
 	});
+	const [showRegionOnPreview, setShowRegionOnPreview] = useState(true);
 	const [isInpainting, setIsInpainting] = useState(false);
 	const [inpaintProgress, setInpaintProgress] = useState(0);
 	const [inpaintStep, setInpaintStep] = useState("");
@@ -69,7 +71,39 @@ export function Captions() {
 	const inpaintStopRequestedRef = useRef(false);
 	const containerRef = useRef<HTMLDivElement>(null);
 	const segments = useTranscriptStore((s) => s.segments);
+	const setInpaintRegionOverlay = usePreviewStore(
+		(s) => s.setInpaintRegionOverlay,
+	);
 	const editor = useEditor();
+
+	// Mirror the removal region onto the preview as a highlight box whenever
+	// the inputs form a valid region and the preview toggle is on.
+	useEffect(() => {
+		if (!showRegionOnPreview) {
+			setInpaintRegionOverlay(null);
+			return;
+		}
+		const region = {
+			x1: Number.parseFloat(inpaintRegion.x1),
+			y1: Number.parseFloat(inpaintRegion.y1),
+			x2: Number.parseFloat(inpaintRegion.x2),
+			y2: Number.parseFloat(inpaintRegion.y2),
+		};
+		const isValid =
+			[region.x1, region.y1, region.x2, region.y2].every(
+				(v) => !Number.isNaN(v) && v >= 0 && v <= 1,
+			) &&
+			region.x2 > region.x1 &&
+			region.y2 > region.y1;
+		setInpaintRegionOverlay(isValid ? region : null);
+	}, [showRegionOnPreview, inpaintRegion, setInpaintRegionOverlay]);
+
+	// Remove the highlight when leaving the Captions view
+	useEffect(() => {
+		return () => {
+			usePreviewStore.getState().setInpaintRegionOverlay(null);
+		};
+	}, []);
 
 	// Determine which languages to show based on engine
 	const availableLanguages = selectedEngine === "sarvam"
@@ -1289,6 +1323,22 @@ export function Captions() {
 								/>
 							</div>
 						))}
+					</div>
+
+					<div className="flex items-center justify-between gap-2">
+						<div className="flex flex-col">
+							<Label className="text-xs" htmlFor="show-inpaint-region">
+								Show on preview
+							</Label>
+							<span className="text-[10px] text-muted-foreground">
+								The green box shows what will be erased.
+							</span>
+						</div>
+						<Switch
+							id="show-inpaint-region"
+							checked={showRegionOnPreview}
+							onCheckedChange={setShowRegionOnPreview}
+						/>
 					</div>
 
 					{inpaintError && (

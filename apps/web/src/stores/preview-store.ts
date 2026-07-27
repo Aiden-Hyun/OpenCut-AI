@@ -10,9 +10,17 @@ interface PreviewOverlaysState {
 	bookmarks: boolean;
 }
 
+export interface InpaintRegionOverlay {
+	x1: number;
+	y1: number;
+	x2: number;
+	y2: number;
+}
+
 interface PreviewState {
 	layoutGuide: LayoutGuideSettings;
 	overlays: PreviewOverlaysState;
+	inpaintRegionOverlay: InpaintRegionOverlay | null;
 	setLayoutGuide: (settings: Partial<LayoutGuideSettings>) => void;
 	toggleLayoutGuide: (platform: TPlatformLayout) => void;
 	setOverlayVisibility: ({
@@ -27,6 +35,7 @@ interface PreviewState {
 	}: {
 		overlay: keyof PreviewOverlaysState;
 	}) => void;
+	setInpaintRegionOverlay: (region: InpaintRegionOverlay | null) => void;
 }
 
 const DEFAULT_PREVIEW_OVERLAYS: PreviewOverlaysState = {
@@ -38,6 +47,7 @@ export const usePreviewStore = create<PreviewState>()(
 		(set) => ({
 			layoutGuide: { platform: null },
 			overlays: DEFAULT_PREVIEW_OVERLAYS,
+			inpaintRegionOverlay: null,
 			setLayoutGuide: (settings) => {
 				set((state) => ({
 					layoutGuide: {
@@ -68,6 +78,9 @@ export const usePreviewStore = create<PreviewState>()(
 						[overlay]: !state.overlays[overlay],
 					},
 				}));
+			},
+			setInpaintRegionOverlay: (region) => {
+				set({ inpaintRegionOverlay: region });
 			},
 		}),
 		{

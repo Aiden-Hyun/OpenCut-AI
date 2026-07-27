@@ -12,6 +12,7 @@ import { buildScene } from "@/services/renderer/scene-builder";
 import { getLastFrameTime } from "@/lib/time";
 import { PreviewInteractionOverlay } from "./preview-interaction-overlay";
 import { BookmarkNoteOverlay } from "./bookmark-note-overlay";
+import { InpaintRegionOverlay } from "./inpaint-region-overlay";
 import { ContextMenu, ContextMenuTrigger } from "@/components/ui/context-menu";
 import { usePreviewStore } from "@/stores/preview-store";
 import { PreviewContextMenu } from "./context-menu";
@@ -78,7 +79,14 @@ function RenderTreeController() {
 		});
 
 		editor.renderer.setRenderTree({ renderTree });
-	}, [tracks, mediaAssets, activeProject?.settings.background, activeProject?.settings.proxyEditing, width, height]);
+	}, [
+		tracks,
+		mediaAssets,
+		activeProject?.settings.background,
+		activeProject?.settings.proxyEditing,
+		width,
+		height,
+	]);
 
 	return null;
 }
@@ -203,6 +211,7 @@ function PreviewCanvas({
 							canvasRef={canvasRef}
 							containerRef={canvasBoundsRef}
 						/>
+						<InpaintRegionOverlay />
 						{overlays.bookmarks && <BookmarkNoteOverlay />}
 					</div>
 				</ContextMenuTrigger>
