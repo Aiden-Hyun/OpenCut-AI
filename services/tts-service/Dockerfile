@@ -32,7 +32,7 @@ ARG TORCH_VARIANT=cpu
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/root/.cache/pip \
     if [ "$TORCH_VARIANT" != "cpu" ]; then \
-      uv pip install --system \
+      uv pip install --system --reinstall \
         --index-strategy unsafe-best-match \
         --index-url "https://download.pytorch.org/whl/${TORCH_VARIANT}" \
         --extra-index-url https://pypi.org/simple \
