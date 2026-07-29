@@ -106,6 +106,14 @@ export interface SubtitleSegment {
 	hit_ratio: number;
 }
 
+/** One entry of a removal schedule — the timing plus what to erase in it.
+ *  Detected segments satisfy this shape, and so does a hand-built entry for
+ *  an already-extracted span (which is one whole-clip entry). */
+export type SubtitleScheduleEntry = Pick<
+	SubtitleSegment,
+	"start" | "end" | "regions"
+>;
+
 export interface SubtitleTimelineDetection {
 	segments: SubtitleSegment[];
 	/** Video duration in seconds. */
@@ -545,10 +553,12 @@ class AIClient {
 	/** Start a burned-in subtitle removal (STTN inpainting) job.
 	 *  Pass a single region to erase one box for the whole video, or
 	 *  `{ schedule }` from detectSubtitleTimeline to erase time-varying
-	 *  region sets in one job. Coordinates are fractions (0-1) of the frame. */
+	 *  region sets in one job. Coordinates are fractions (0-1) of the frame,
+	 *  so a schedule built for a full video carries over unchanged to a span
+	 *  cut out of it. */
 	async removeSubtitles(
 		file: File,
-		target: SubtitleRegion | { schedule: SubtitleSegment[] },
+		target: SubtitleRegion | { schedule: SubtitleScheduleEntry[] },
 	): Promise<{ job_id: string }> {
 		const formData = new FormData();
 		formData.append("file", file);

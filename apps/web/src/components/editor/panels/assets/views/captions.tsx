@@ -33,9 +33,14 @@ import { useTranscriptStore } from "@/stores/transcript-store";
 import { usePreviewStore } from "@/stores/preview-store";
 import { getElementsAtTime, hasMediaId } from "@/lib/timeline";
 import { processMediaAssets } from "@/lib/media/processing";
+import { extractSpan, SpanExtractionError } from "@/lib/media/extract-span";
 import { toast } from "sonner";
 import { aiClient } from "@/lib/ai-client";
-import type { SubtitleTimelineDetection } from "@/lib/ai-client";
+import type {
+	SubtitleRegion,
+	SubtitleScheduleEntry,
+	SubtitleTimelineDetection,
+} from "@/lib/ai-client";
 import { formatTimeCode } from "@/lib/time";
 import type { TimelineElement } from "@/types/timeline";
 import { useBackgroundTasksStore } from "@/stores/background-tasks-store";
@@ -44,6 +49,15 @@ interface SubtitleTrackInfo {
 	trackId: string;
 	language: string;
 }
+
+/** Video track the cleaned spans are placed on. Reused across runs so a
+ *  second pass does not scatter overlays over several tracks. */
+const CLEAN_TRACK_NAME = "Subtitle removal";
+
+/** Poll interval for inpaint job status, in ms. */
+const INPAINT_POLL_MS = 3000;
+/** Consecutive status-poll failures tolerated before giving up. */
+const MAX_POLL_FAILURES = 5;
 
 export function Captions() {
 	const [selectedEngine, setSelectedEngine] = useState<TranscriptionEngine>("whisper");
@@ -82,8 +96,12 @@ export function Captions() {
 	// Segment the playhead currently sits in — drives the preview boxes and
 	// the highlighted row.
 	const [activeSegment, setActiveSegment] = useState<number | null>(null);
-	// Set by the Stop button; the polling loop exits on its next tick.
+	// Set by the Stop button; the segment loop and the polling loop both exit
+	// on their next tick.
 	const inpaintStopRequestedRef = useRef(false);
+	// Aborts an in-flight client-side span extraction, which is the one phase
+	// that does not poll and so cannot notice the stop flag on its own.
+	const inpaintAbortRef = useRef<AbortController | null>(null);
 	const containerRef = useRef<HTMLDivElement>(null);
 	const segments = useTranscriptStore((s) => s.segments);
 	const setInpaintRegionOverlays = usePreviewStore(
@@ -793,23 +811,28 @@ export function Captions() {
 
 	/** Resolve the first video media file on the timeline (shared by the
 	 *  auto-detect and Remove handlers), ensuring it has a file extension
-	 *  since the backend rejects files without one. */
-	const resolveTimelineVideoFile = (): { file: File } | { error: string } => {
+	 *  since the backend rejects files without one. Also reports the track it
+	 *  sits on so cleaned spans can be stacked directly above it. */
+	const resolveTimelineVideoFile = ():
+		| { file: File; trackId: string }
+		| { error: string } => {
 		const tracks = editor.timeline.getTracks();
 		let foundMediaId: string | null = null;
+		let foundTrackId: string | null = null;
 
 		for (const track of tracks) {
 			for (const element of track.elements) {
 				if (track.type === "video" && hasMediaId(element as TimelineElement)) {
 					foundMediaId = (element as TimelineElement & { mediaId: string })
 						.mediaId;
+					foundTrackId = track.id;
 					break;
 				}
 			}
 			if (foundMediaId) break;
 		}
 
-		if (!foundMediaId) {
+		if (!foundMediaId || !foundTrackId) {
 			return { error: "No video found on the timeline. Import a video file first." };
 		}
 
@@ -830,8 +853,41 @@ export function Captions() {
 			file = new File([file], newName, { type: file.type || "video/mp4" });
 		}
 
-		return { file };
+		return { file, trackId: foundTrackId };
 	};
+
+	/** Find, or create, the video track cleaned spans are placed on.
+	 *
+	 *  buildScene reverses the tracks array before painting nodes in order
+	 *  (scene-builder.ts), so a LOWER array index is painted LATER and ends up
+	 *  on top. Inserting at the source track's index therefore drops the
+	 *  overlay directly above it — and still below the text subtitle tracks,
+	 *  which are added at index 0. */
+	const ensureCleanTrack = ({
+		sourceTrackId,
+	}: {
+		sourceTrackId: string;
+	}): string => {
+		const tracks = editor.timeline.getTracks();
+		const existing = tracks.find(
+			(track) => track.type === "video" && track.name === CLEAN_TRACK_NAME,
+		);
+		if (existing) return existing.id;
+
+		const sourceIndex = tracks.findIndex((track) => track.id === sourceTrackId);
+		const trackId = editor.timeline.addTrack({
+			type: "video",
+			index: sourceIndex === -1 ? 0 : sourceIndex,
+		});
+		editor.timeline.renameTrack({ trackId, name: CLEAN_TRACK_NAME });
+		return trackId;
+	};
+
+	/** Human label for a cleaned span, e.g. `Clean 3:50–4:04`. */
+	const cleanSpanLabel = ({ start, end }: { start: number; end: number }) =>
+		`Clean ${formatTimeCode({ timeInSeconds: start, format: "MM:SS" })}–${formatTimeCode(
+			{ timeInSeconds: end, format: "MM:SS" },
+		)}`;
 
 	/** Segments the Remove job would run on: enabled and with regions. */
 	const scheduledSegments = detection
@@ -840,6 +896,14 @@ export function Captions() {
 					enabledSegments[index] && segment.regions.length > 0,
 			)
 		: [];
+
+	/** Segments that CAN be checked — the ones that found something to erase. */
+	const selectableSegmentCount = detection
+		? detection.segments.filter((segment) => segment.regions.length > 0).length
+		: 0;
+	const allSegmentsEnabled =
+		scheduledSegments.length === selectableSegmentCount;
+	const noSegmentsEnabled = scheduledSegments.length === 0;
 
 	const handleDetectSubtitles = async () => {
 		try {
@@ -914,11 +978,25 @@ export function Captions() {
 		);
 	};
 
+	/** Check/uncheck every segment that has something to erase. Segments with
+	 *  no regions stay off — there is no work to do there. */
+	const handleSetAllSegments = (enabled: boolean) => {
+		if (!detection) return;
+		setEnabledSegments(
+			detection.segments.map(
+				(segment) => enabled && segment.regions.length > 0,
+			),
+		);
+	};
+
+	/** Abort the whole run. Segments already placed on the timeline are left
+	 *  alone — they are finished, valid work. */
 	const handleStopInpaint = async () => {
-		if (!inpaintJobId) return;
 		setIsCancellingInpaint(true);
 		inpaintStopRequestedRef.current = true;
+		inpaintAbortRef.current?.abort();
 		setInpaintStep("Cancelling...");
+		if (!inpaintJobId) return;
 		try {
 			await aiClient.cancelInpaintJob(inpaintJobId);
 		} catch (err) {
@@ -926,6 +1004,243 @@ export function Captions() {
 			// job keeps running server-side at worst.
 			console.warn("Cancel request failed:", err);
 		}
+	};
+
+	/** Upload one file to the inpaint service, poll it to completion and hand
+	 *  back the cleaned video. Returns null when the run was stopped or the
+	 *  job was cancelled server-side. */
+	const runInpaintJob = async ({
+		file,
+		target,
+		onPhase,
+	}: {
+		file: File;
+		target: SubtitleRegion | { schedule: SubtitleScheduleEntry[] };
+		onPhase: (phase: string, percent?: number) => void;
+	}): Promise<Blob | null> => {
+		onPhase("Uploading...", 0);
+		const { job_id } = await aiClient.removeSubtitles(file, target);
+		setInpaintJobId(job_id);
+
+		try {
+			let consecutiveFailures = 0;
+			for (;;) {
+				await new Promise((resolve) => setTimeout(resolve, INPAINT_POLL_MS));
+				if (inpaintStopRequestedRef.current) return null;
+
+				let status: Awaited<ReturnType<typeof aiClient.inpaintJobStatus>>;
+				try {
+					status = await aiClient.inpaintJobStatus(job_id);
+					consecutiveFailures = 0;
+				} catch (pollError) {
+					consecutiveFailures++;
+					if (consecutiveFailures >= MAX_POLL_FAILURES) throw pollError;
+					continue;
+				}
+
+				if (status.status === "cancelled") return null;
+				if (status.status === "error") {
+					throw new Error(status.error || "Subtitle removal failed.");
+				}
+
+				const percent = Math.round((status.progress ?? 0) * 100);
+				onPhase(status.message || `Processing... ${percent}%`, percent);
+
+				if (status.status === "done") break;
+			}
+
+			onPhase("Downloading result...");
+			const response = await fetch(aiClient.inpaintResultUrl(job_id));
+			if (!response.ok) {
+				throw new Error(`Failed to download result (${response.status})`);
+			}
+			return await response.blob();
+		} finally {
+			setInpaintJobId(null);
+		}
+	};
+
+	/** Import a cleaned clip into the media panel and return its media id. */
+	const importCleanedClip = async ({
+		blob,
+		name,
+	}: {
+		blob: Blob;
+		name: string;
+	}): Promise<{ mediaId: string; duration?: number }> => {
+		const cleanFile = new File([blob], name, { type: "video/mp4" });
+		const processed = await processMediaAssets({ files: [cleanFile] });
+		if (processed.length === 0) {
+			throw new Error("Failed to process the cleaned video.");
+		}
+		const mediaId = await editor.media.addMediaAsset({
+			projectId: editor.project.getActive().metadata.id,
+			asset: processed[0],
+		});
+		return { mediaId, duration: processed[0].duration };
+	};
+
+	/** Span-only removal.
+	 *
+	 *  For every enabled segment: cut that stretch out of the source in the
+	 *  browser, send just that clip to the inpaint service, and drop the
+	 *  cleaned result onto a dedicated track above the original as a muted
+	 *  overlay. Nothing else is decoded, re-encoded or replaced.
+	 *
+	 *  Segments run one at a time — the service has a single worker, so
+	 *  parallelism would only queue. Returns how many overlays were placed and
+	 *  the extraction error, if any, that ended the run early. */
+	const runSpanRemoval = async ({
+		file,
+		sourceTrackId,
+		taskId,
+		bgTasks,
+	}: {
+		file: File;
+		sourceTrackId: string;
+		taskId: string;
+		bgTasks: ReturnType<typeof useBackgroundTasksStore.getState>;
+	}): Promise<{
+		placed: number;
+		extractionFailure: SpanExtractionError | null;
+	}> => {
+		const total = scheduledSegments.length;
+		let placed = 0;
+		let cleanTrackId: string | null = null;
+
+		for (let index = 0; index < total; index++) {
+			if (inpaintStopRequestedRef.current) break;
+
+			const segment = scheduledSegments[index];
+			const label = `Segment ${index + 1} of ${total}`;
+			const phase = (text: string, percent?: number) => {
+				setInpaintStep(`${label} — ${text}`);
+				if (percent !== undefined) setInpaintProgress(percent);
+				bgTasks.updateTask(taskId, { progress: `${label} — ${text}` });
+			};
+
+			let span: File;
+			try {
+				phase("Extracting span...", 0);
+				span = await extractSpan({
+					file,
+					start: segment.start,
+					end: segment.end,
+					signal: inpaintAbortRef.current?.signal,
+				});
+			} catch (err) {
+				if (err instanceof SpanExtractionError) {
+					return { placed, extractionFailure: err };
+				}
+				throw err;
+			}
+
+			if (inpaintStopRequestedRef.current) break;
+
+			// Region coordinates are fractions of the frame, so they carry over
+			// to the span unchanged. The span itself is the whole schedule: one
+			// entry covering the entire clip.
+			const spanDuration = segment.end - segment.start;
+			const blob = await runInpaintJob({
+				file: span,
+				target: {
+					schedule: [
+						{ start: 0, end: spanDuration, regions: segment.regions },
+					],
+				},
+				onPhase: phase,
+			});
+			if (!blob) break;
+
+			phase("Importing cleaned span...");
+			const imported = await importCleanedClip({
+				blob,
+				name: `clean-${span.name}`,
+			});
+
+			// Trust the imported clip's own duration where it is known: the
+			// re-encode can land a frame either side of the requested span, and
+			// stretching the element to match would freeze or drop a frame.
+			const duration = imported.duration ?? spanDuration;
+
+			const supportsTransaction =
+				typeof editor.command.beginTransaction === "function";
+			if (supportsTransaction) editor.command.beginTransaction();
+			try {
+				if (!cleanTrackId) {
+					cleanTrackId = ensureCleanTrack({ sourceTrackId });
+				}
+				editor.timeline.insertElement({
+					placement: { mode: "explicit", trackId: cleanTrackId },
+					element: {
+						type: "video",
+						mediaId: imported.mediaId,
+						name: cleanSpanLabel({ start: segment.start, end: segment.end }),
+						startTime: segment.start,
+						duration,
+						trimStart: 0,
+						trimEnd: 0,
+						sourceDuration: duration,
+						// The original underneath keeps playing its audio; the
+						// span carries none anyway.
+						muted: true,
+						opacity: 1,
+						transform: { scale: 1, position: { x: 0, y: 0 }, rotate: 0 },
+					},
+				});
+				if (supportsTransaction) editor.command.commitTransaction();
+			} catch (placementError) {
+				if (supportsTransaction) editor.command.rollbackTransaction();
+				throw placementError;
+			}
+
+			placed++;
+		}
+
+		return { placed, extractionFailure: null };
+	};
+
+	/** Whole-video removal: upload the entire source, re-encode every frame
+	 *  and import the result as a new media asset. Kept for manual
+	 *  single-region mode and as the fallback when the browser cannot cut the
+	 *  source itself. */
+	const runWholeVideoRemoval = async ({
+		file,
+		target,
+		taskId,
+		bgTasks,
+	}: {
+		file: File;
+		target: SubtitleRegion | { schedule: SubtitleScheduleEntry[] };
+		taskId: string;
+		bgTasks: ReturnType<typeof useBackgroundTasksStore.getState>;
+	}): Promise<boolean> => {
+		const blob = await runInpaintJob({
+			file,
+			target,
+			onPhase: (text, percent) => {
+				setInpaintStep(text);
+				if (percent !== undefined) setInpaintProgress(percent);
+				bgTasks.updateTask(taskId, { progress: text });
+			},
+		});
+		if (!blob) return false;
+
+		setInpaintStep("Importing result...");
+		bgTasks.updateTask(taskId, { progress: "Importing result..." });
+		const baseName = file.name.replace(/\.[^.]+$/, "");
+		const resultName = `${baseName}-clean.mp4`;
+		await importCleanedClip({ blob, name: resultName });
+
+		toast.success("Burned-in subtitles removed", {
+			description: `${resultName} added to your media.`,
+		});
+		bgTasks.updateTask(taskId, {
+			status: "completed",
+			progress: resultName,
+			completedAt: Date.now(),
+		});
+		return true;
 	};
 
 	const handleRemoveBurnedSubtitles = async () => {
@@ -969,6 +1284,7 @@ export function Captions() {
 			setInpaintError(null);
 			setInpaintProgress(0);
 			inpaintStopRequestedRef.current = false;
+			inpaintAbortRef.current = new AbortController();
 
 			// Find the first video media asset on the timeline (same media
 			// resolution as the transcribe handler, restricted to video)
@@ -978,95 +1294,96 @@ export function Captions() {
 				setInpaintError(resolved.error);
 				return;
 			}
-			const { file } = resolved;
+			const { file, trackId: sourceTrackId } = resolved;
 
 			bgTasks.addTask({
 				id: taskId,
 				type: "inpaint",
 				label: "Remove burned-in subtitles (STTN)",
-				progress: "Uploading...",
+				progress: "Starting...",
 			});
 
-			setInpaintStep("Uploading video...");
-			const { job_id } = await aiClient.removeSubtitles(
-				file,
-				detection ? { schedule: scheduledSegments } : region,
-			);
-			setInpaintJobId(job_id);
-
-			// Poll every 3s until the job finishes or the user hits Stop
-			let consecutiveFailures = 0;
-			for (;;) {
-				await new Promise((resolve) => setTimeout(resolve, 3000));
-				if (inpaintStopRequestedRef.current) {
-					bgTasks.removeTask(taskId);
-					toast("Subtitle removal cancelled");
-					return;
-				}
-				let status: Awaited<ReturnType<typeof aiClient.inpaintJobStatus>>;
-				try {
-					status = await aiClient.inpaintJobStatus(job_id);
-					consecutiveFailures = 0;
-				} catch (pollError) {
-					consecutiveFailures++;
-					if (consecutiveFailures >= 5) throw pollError;
-					continue;
-				}
-
-				if (status.status === "cancelled") {
-					bgTasks.removeTask(taskId);
-					toast("Subtitle removal cancelled");
-					return;
-				}
-				if (status.status === "error") {
-					throw new Error(status.error || "Subtitle removal failed.");
-				}
-
-				const percent = Math.round((status.progress ?? 0) * 100);
-				setInpaintProgress(percent);
-				const stepText = status.message || `Processing... ${percent}%`;
-				setInpaintStep(stepText);
-				bgTasks.updateTask(taskId, { progress: `${percent}% — ${stepText}` });
-
-				if (status.status === "done") break;
-			}
-
-			// Download the cleaned video and import it into the media panel
-			setInpaintStep("Importing result...");
-			bgTasks.updateTask(taskId, { progress: "Importing result..." });
-			const response = await fetch(aiClient.inpaintResultUrl(job_id));
-			if (!response.ok) {
-				throw new Error(`Failed to download result (${response.status})`);
-			}
-			const blob = await response.blob();
-			const baseName = file.name.replace(/\.[^.]+$/, "");
-			const resultFile = new File([blob], `${baseName}-clean.mp4`, {
-				type: "video/mp4",
-			});
-
-			const activeProject = editor.project.getActive();
-			const processedAssets = await processMediaAssets({
-				files: [resultFile],
-			});
-			if (processedAssets.length === 0) {
-				throw new Error("Failed to process the cleaned video.");
-			}
-			for (const asset of processedAssets) {
-				await editor.media.addMediaAsset({
-					projectId: activeProject.metadata.id,
-					asset,
+			// Manual single-region mode has no per-segment timing to cut on, so
+			// it stays on the whole-video path.
+			if (!detection) {
+				const finished = await runWholeVideoRemoval({
+					file,
+					target: region,
+					taskId,
+					bgTasks,
 				});
+				if (!finished) {
+					bgTasks.removeTask(taskId);
+					toast("Subtitle removal cancelled");
+				}
+				return;
 			}
 
-			toast.success("Burned-in subtitles removed", {
-				description: `${resultFile.name} added to your media.`,
+			const { placed, extractionFailure } = await runSpanRemoval({
+				file,
+				sourceTrackId,
+				taskId,
+				bgTasks,
 			});
+
+			// Nothing placed and the browser could not cut the source: fall all
+			// the way back to re-encoding the whole video, as before.
+			if (extractionFailure && placed === 0) {
+				toast.warning("Falling back to whole-video processing", {
+					description: `${extractionFailure.message} The entire video will be re-encoded, which is much slower.`,
+				});
+				const finished = await runWholeVideoRemoval({
+					file,
+					target: { schedule: scheduledSegments },
+					taskId,
+					bgTasks,
+				});
+				if (!finished) {
+					bgTasks.removeTask(taskId);
+					toast("Subtitle removal cancelled");
+				}
+				return;
+			}
+
+			if (placed === 0) {
+				bgTasks.removeTask(taskId);
+				toast("Subtitle removal cancelled");
+				return;
+			}
+
+			if (extractionFailure) {
+				// Some segments landed before extraction broke — keep them and
+				// say what is left undone rather than discarding valid work.
+				setInpaintError(
+					`Stopped after ${placed} of ${scheduledSegments.length} segment(s): ${extractionFailure.message}`,
+				);
+			}
+
+			// Stopping part way through still leaves finished overlays behind,
+			// so report what landed either way.
+			const stopped = inpaintStopRequestedRef.current;
+			toast.success(
+				`Placed ${placed} cleaned segment${placed === 1 ? "" : "s"} on the "${CLEAN_TRACK_NAME}" track`,
+				{
+					description: stopped
+						? `Stopped after ${placed} of ${scheduledSegments.length}. The original clip is untouched — hide or delete the track to undo.`
+						: "They overlay the original clip, which is untouched — hide or delete the track to undo.",
+				},
+			);
 			bgTasks.updateTask(taskId, {
 				status: "completed",
-				progress: resultFile.name,
+				progress: `${placed} segment${placed === 1 ? "" : "s"} placed`,
 				completedAt: Date.now(),
 			});
 		} catch (err) {
+			// Stop mid-extraction surfaces as an AbortError; that is a
+			// cancellation, not a failure.
+			if (err instanceof DOMException && err.name === "AbortError") {
+				bgTasks.removeTask(taskId);
+				toast("Subtitle removal cancelled");
+				return;
+			}
+
 			console.error("Subtitle removal failed:", err);
 			const message =
 				err instanceof Error ? err.message : "An unexpected error occurred";
@@ -1093,6 +1410,7 @@ export function Captions() {
 			setInpaintJobId(null);
 			setIsCancellingInpaint(false);
 			inpaintStopRequestedRef.current = false;
+			inpaintAbortRef.current = null;
 		}
 	};
 
@@ -1399,15 +1717,35 @@ export function Captions() {
 										{detection.windows} windows
 									</span>
 								</Label>
-								<Button
-									variant="ghost"
-									size="sm"
-									className="h-6 px-2 text-xs text-muted-foreground"
-									onClick={handleClearDetection}
-									disabled={isInpainting}
-								>
-									Clear detection
-								</Button>
+								<div className="flex items-center gap-0.5">
+									<Button
+										variant="ghost"
+										size="sm"
+										className="h-6 px-2 text-xs text-muted-foreground"
+										onClick={() => handleSetAllSegments(true)}
+										disabled={isInpainting || allSegmentsEnabled}
+									>
+										All
+									</Button>
+									<Button
+										variant="ghost"
+										size="sm"
+										className="h-6 px-2 text-xs text-muted-foreground"
+										onClick={() => handleSetAllSegments(false)}
+										disabled={isInpainting || noSegmentsEnabled}
+									>
+										None
+									</Button>
+									<Button
+										variant="ghost"
+										size="sm"
+										className="h-6 px-2 text-xs text-muted-foreground"
+										onClick={handleClearDetection}
+										disabled={isInpainting}
+									>
+										Clear
+									</Button>
+								</div>
 							</div>
 
 							<div className="flex max-h-52 flex-col gap-1 overflow-y-auto">
@@ -1531,7 +1869,7 @@ export function Captions() {
 								variant="outline"
 								className="shrink-0 text-destructive hover:text-destructive"
 								onClick={handleStopInpaint}
-								disabled={!inpaintJobId || isCancellingInpaint}
+								disabled={isCancellingInpaint}
 							>
 								{isCancellingInpaint ? "Stopping..." : "Stop"}
 							</Button>
@@ -1543,17 +1881,21 @@ export function Captions() {
 							onClick={handleRemoveBurnedSubtitles}
 							disabled={isDetectingRegion}
 						>
-							Remove subtitles
+							{detection
+								? `Remove from ${scheduledSegments.length} segment${
+										scheduledSegments.length === 1 ? "" : "s"
+									}`
+								: "Remove subtitles"}
 						</Button>
 					)}
 
 					<p className="text-[10px] text-muted-foreground">
 						{detection
-							? `Will erase ${scheduledSegments.reduce(
+							? `Only the ${scheduledSegments.length} selected segment(s) are cut out, cleaned (${scheduledSegments.reduce(
 									(sum, segment) => sum + segment.regions.length,
 									0,
-								)} area(s) across ${scheduledSegments.length} selected segment(s); the rest of the video is left untouched.`
-							: "Will erase the region above for the whole video."}{" "}
+								)} area(s)) and placed as overlay clips on a "${CLEAN_TRACK_NAME}" track. The original clip is never re-encoded or replaced.`
+							: "Will erase the region above for the whole video, re-encoding every frame."}{" "}
 						CPU processing is slow — expect several minutes per video minute.
 					</p>
 				</div>
