@@ -4,16 +4,25 @@ Adapted from the video-subtitle-remover project (Apache-2.0),
 backend/inpaint/sttn_auto_inpaint.py and backend/tools/inpaint_tools.py:
 https://github.com/YaoFANGUK/video-subtitle-remover
 
-Simplified for a fixed rectangular subtitle region supplied by the caller:
-no OCR subtitle detection, no GUI hooks, no VRAM heuristics. Frames are
-cropped to full-width horizontal bands around the region (VSR's speed
-trick: the model only ever sees a 640x120 strip, not the whole frame),
-inpainted with a sliding temporal window, then composited back into the
-original frames using the region mask.
+Simplified for rectangular subtitle regions supplied by the caller: no OCR
+subtitle detection, no GUI hooks, no VRAM heuristics. Frames are cropped to
+full-width horizontal bands around each region (VSR's speed trick: the
+model only ever sees a 640x120 strip, not the whole frame), inpainted with a
+sliding temporal window, then composited back into the original frames.
+
+The caller supplies a SCHEDULE rather than one region, so a compilation
+whose burned-in captions move (and sometimes double up) is handled in a
+single pass: each entry names a time range and the regions active in it.
+Entries with no regions — and any gap between entries — are copied through
+untouched, and the whole job still produces one continuous encode, so there
+are no re-encode seams. Multiple regions in one entry are inpainted as
+sequential passes over the same frame buffer, so a later pass sees the
+earlier pass's output and adjacent boxes cannot undo each other.
 """
 
 import logging
 import math
+from dataclasses import dataclass, field
 from typing import Callable
 
 import cv2
@@ -33,9 +42,54 @@ MAX_LOAD_NUM = 50       # sttnMaxLoadNum (frames per chunk)
 MODEL_INPUT_WIDTH = 640
 MODEL_INPUT_HEIGHT = 120
 
+# Progress weight of copying one frame through relative to inpainting one
+# region-frame. Pass-through stretches are ~50x cheaper than an STTN pass,
+# but they still cost something, so counting them keeps progress monotonic
+# and lets it reach 1.0 exactly at the last written frame.
+PASSTHROUGH_COST = 0.02
+
 
 class InpaintCancelled(Exception):
     """Raised to abort inpaint_video when the caller requests cancellation."""
+
+
+@dataclass
+class InpaintProgress:
+    """Progress snapshot handed to inpaint_video's on_progress callback.
+
+    ``fraction`` is weighted by region-frames — the actual unit of work —
+    so it advances evenly whether the current stretch has zero, one or two
+    active regions. ``frames_written`` / ``total_frames`` stay honest frame
+    counts for the user-facing message.
+    """
+
+    fraction: float
+    frames_written: int
+    total_frames: int
+
+
+@dataclass
+class _Region:
+    """One rectangle to erase, in pixels, with its STTN band layout."""
+
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+    bands: list[tuple[int, int]] = field(default_factory=list)
+
+
+@dataclass
+class _Span:
+    """A contiguous half-open frame range and the regions active in it."""
+
+    first: int
+    last: int
+    regions: list[_Region]
+
+    @property
+    def length(self) -> int:
+        return self.last - self.first
 
 
 class STTNInpaint:
@@ -143,20 +197,70 @@ def compute_bands(width: int, height: int, y0: int, y1: int) -> tuple[list[tuple
     return bands, split_h
 
 
+def _plan_spans(
+    schedule: list[dict],
+    width: int,
+    height: int,
+    total: int,
+    fps: float,
+) -> list[_Span]:
+    """Turn a seconds/fractions schedule into frame-indexed pixel spans.
+
+    The returned spans are sorted, non-overlapping and cover the whole
+    video: gaps between entries (and entries without regions) come back as
+    spans with an empty region list, i.e. pure pass-through.
+    """
+    spans: list[_Span] = []
+    cursor = 0
+    for entry in sorted(schedule, key=lambda e: float(e["start"])):
+        end = float(entry["end"])
+        first = max(cursor, int(math.floor(float(entry["start"]) * fps)))
+        last = total if math.isinf(end) else min(total, int(math.ceil(end * fps)))
+        if last <= first:
+            logger.info(
+                "Skipping schedule entry %.2f-%.2fs: empty after clamping to %d frames",
+                float(entry["start"]), end, total,
+            )
+            continue
+        if first > cursor:
+            spans.append(_Span(first=cursor, last=first, regions=[]))
+
+        regions: list[_Region] = []
+        for rect in entry.get("regions") or []:
+            fx1, fy1, fx2, fy2 = rect
+            x0 = max(0, min(width - 1, int(round(fx1 * width))))
+            x1 = max(x0 + 1, min(width, int(round(fx2 * width))))
+            y0 = max(0, min(height - 1, int(round(fy1 * height))))
+            y1 = max(y0 + 1, min(height, int(round(fy2 * height))))
+            bands, _ = compute_bands(width, height, y0, y1)
+            regions.append(_Region(x0=x0, y0=y0, x1=x1, y1=y1, bands=bands))
+
+        spans.append(_Span(first=first, last=last, regions=regions))
+        cursor = last
+    if cursor < total:
+        spans.append(_Span(first=cursor, last=total, regions=[]))
+    return spans
+
+
 def inpaint_video(
     inpainter: STTNInpaint,
     input_path: str,
     output_path: str,
-    region: tuple[float, float, float, float],
-    on_progress: Callable[[int, int], None] | None = None,
+    schedule: list[dict],
+    on_progress: Callable[[InpaintProgress], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> int:
-    """Remove the given region from a video by STTN inpainting.
+    """Remove a time-varying set of regions from a video by STTN inpainting.
 
-    :param region: (x1, y1, x2, y2) as fractions (0-1) of the frame
-    :param on_progress: callback(frames_done, total_frames)
-    :param should_cancel: polled between chunks and between sliding
-        windows; return True to abort promptly via InpaintCancelled
+    :param schedule: entries ``{"start": seconds, "end": seconds, "regions":
+        [(x1, y1, x2, y2), ...]}`` with coordinates as fractions (0-1) of
+        the frame. ``end`` may be ``float("inf")`` for "to the end". Entries
+        are sorted and clamped so they never overlap; frames covered by no
+        entry, or by an entry with no regions, are copied through untouched.
+        A single whole-video entry reproduces the old single-region job.
+    :param on_progress: callback(InpaintProgress)
+    :param should_cancel: polled between chunks, between regions and between
+        sliding windows; return True to abort promptly via InpaintCancelled
     :returns: number of frames written
     :raises InpaintCancelled: when should_cancel() turns True
     """
@@ -173,22 +277,30 @@ def inpaint_video(
     if width <= 0 or height <= 0:
         reader.release()
         raise ValueError("Video has invalid dimensions.")
+    if total <= 0:
+        reader.release()
+        raise ValueError("Video reports no frames; cannot schedule inpainting.")
 
-    fx1, fy1, fx2, fy2 = region
-    x0 = max(0, min(width - 1, int(round(fx1 * width))))
-    x1 = max(x0 + 1, min(width, int(round(fx2 * width))))
-    y0 = max(0, min(height - 1, int(round(fy1 * height))))
-    y1 = max(y0 + 1, min(height, int(round(fy2 * height))))
-
-    # Binary mask of the subtitle region, float for compositing
-    mask = np.zeros((height, width, 1), dtype=np.float32)
-    mask[y0:y1, x0:x1] = 1.0
-
-    bands, split_h = compute_bands(width, height, y0, y1)
-    logger.info(
-        "Inpainting %s: %dx%d @ %.2ffps, %d frames, region px (%d,%d)-(%d,%d), bands=%s",
-        input_path, width, height, fps, total, x0, y0, x1, y1, bands,
+    spans = _plan_spans(schedule, width, height, total, fps)
+    # Unit of work = one region-frame; copied frames count for a fraction.
+    total_units = sum(
+        span.length * (len(span.regions) if span.regions else PASSTHROUGH_COST)
+        for span in spans
     )
+    logger.info(
+        "Inpainting %s: %dx%d @ %.2ffps, %d frames, %d span(s), %.0f region-frames",
+        input_path, width, height, fps, total, len(spans), total_units,
+    )
+    for span in spans:
+        logger.info(
+            "  frames %d-%d (%.2f-%.2fs): %s",
+            span.first, span.last, span.first / fps, span.last / fps,
+            [
+                f"px ({r.x0},{r.y0})-({r.x1},{r.y1}) bands={r.bands}"
+                for r in span.regions
+            ]
+            or "pass-through",
+        )
 
     writer = cv2.VideoWriter(
         output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
@@ -198,62 +310,126 @@ def inpaint_video(
         raise ValueError(f"Cannot open video writer: {output_path}")
 
     frames_done = 0
+    units_done = 0.0
+
+    def report(units: float) -> None:
+        if not on_progress:
+            return
+        on_progress(
+            InpaintProgress(
+                fraction=min(1.0, units / total_units) if total_units > 0 else 1.0,
+                frames_written=frames_done,
+                total_frames=max(total, frames_done),
+            )
+        )
+
     try:
-        while True:
+        for span in spans:
             if should_cancel and should_cancel():
-                raise InpaintCancelled("Cancelled between chunks.")
-            # Read the next chunk of frames
-            frames_hr: list[np.ndarray] = []
-            while len(frames_hr) < MAX_LOAD_NUM:
-                success, image = reader.read()
-                if not success:
+                raise InpaintCancelled("Cancelled between schedule entries.")
+            if not span.regions:
+                # Nothing to erase here: copy the frames straight through.
+                for _ in range(span.length):
+                    success, image = reader.read()
+                    if not success:
+                        break
+                    writer.write(image)
+                    frames_done += 1
+                    units_done += PASSTHROUGH_COST
+                    report(units_done)
+                continue
+
+            remaining = span.length
+            while remaining > 0:
+                if should_cancel and should_cancel():
+                    raise InpaintCancelled("Cancelled between chunks.")
+                # Read the next chunk of frames from this span
+                frames_hr: list[np.ndarray] = []
+                while len(frames_hr) < min(MAX_LOAD_NUM, remaining):
+                    success, image = reader.read()
+                    if not success:
+                        break
+                    frames_hr.append(image)
+                if not frames_hr:
                     break
-                frames_hr.append(image)
-            if not frames_hr:
-                break
+                remaining -= len(frames_hr)
 
-            # Crop + resize each band, run STTN per band
-            comps: dict[int, list[np.ndarray]] = {}
-            for k, (ymin, ymax) in enumerate(bands):
-                band_frames = [
-                    cv2.resize(
-                        f[ymin:ymax, :, :],
-                        (MODEL_INPUT_WIDTH, MODEL_INPUT_HEIGHT),
-                    )
-                    for f in frames_hr
-                ]
-
-                def window_cb(done_windows: int, total_windows: int, band_index: int = k) -> None:
-                    """Report fine-grained progress while a chunk is inpainted.
-
-                    Also the cancellation point: STTNInpaint.inpaint calls this
-                    after every sliding window, so a cancel takes effect within
-                    seconds instead of waiting out the whole chunk.
-                    """
+                # One STTN pass per region, cumulative: each pass crops from
+                # the frames the previous pass already wrote into, so
+                # overlapping or adjacent boxes cannot undo each other.
+                for region_index, region in enumerate(span.regions):
                     if should_cancel and should_cancel():
-                        raise InpaintCancelled("Cancelled between sliding windows.")
-                    if not on_progress:
-                        return
-                    chunk_fraction = (band_index + done_windows / total_windows) / len(bands)
-                    virtual_done = frames_done + chunk_fraction * len(frames_hr)
-                    on_progress(int(virtual_done), max(total, frames_done + len(frames_hr)))
+                        raise InpaintCancelled("Cancelled between regions.")
+                    bands = region.bands
+                    comps: dict[int, list[np.ndarray]] = {}
+                    for k, (ymin, ymax) in enumerate(bands):
+                        band_frames = [
+                            cv2.resize(
+                                f[ymin:ymax, :, :],
+                                (MODEL_INPUT_WIDTH, MODEL_INPUT_HEIGHT),
+                            )
+                            for f in frames_hr
+                        ]
 
-                comps[k] = inpainter.inpaint(band_frames, window_cb=window_cb)
+                        def window_cb(
+                            done_windows: int,
+                            total_windows: int,
+                            band_index: int = k,
+                            done_regions: int = region_index,
+                        ) -> None:
+                            """Report fine-grained progress while a chunk is inpainted.
 
-            # Composite inpainted bands back into the original frames
-            for j, frame in enumerate(frames_hr):
-                for k, (ymin, ymax) in enumerate(bands):
-                    comp = cv2.resize(comps[k][j], (width, ymax - ymin))
-                    # inpaint() returned RGB; swap back to BGR for cv2
-                    comp = cv2.cvtColor(comp.astype(np.uint8), cv2.COLOR_RGB2BGR)
-                    mask_area = mask[ymin:ymax, :]
-                    frame[ymin:ymax, :, :] = (
-                        mask_area * comp + (1 - mask_area) * frame[ymin:ymax, :, :]
-                    )
-                writer.write(frame)
-                frames_done += 1
-                if on_progress:
-                    on_progress(frames_done, max(total, frames_done))
+                            Also the cancellation point: STTNInpaint.inpaint calls
+                            this after every sliding window, so a cancel takes
+                            effect within seconds instead of waiting out the whole
+                            chunk.
+                            """
+                            if should_cancel and should_cancel():
+                                raise InpaintCancelled(
+                                    "Cancelled between sliding windows."
+                                )
+                            band_fraction = (
+                                band_index + done_windows / total_windows
+                            ) / len(bands)
+                            report(
+                                units_done
+                                + (done_regions + band_fraction) * len(frames_hr)
+                            )
+
+                        comps[k] = inpainter.inpaint(band_frames, window_cb=window_cb)
+
+                    # Composite this region's bands back into the frames. The
+                    # mask is a hard rectangle, so copying the band's pixels
+                    # inside the region's x range is the whole compositing step.
+                    for j, frame in enumerate(frames_hr):
+                        for k, (ymin, ymax) in enumerate(bands):
+                            comp = cv2.resize(comps[k][j], (width, ymax - ymin))
+                            # inpaint() returned RGB; swap back to BGR for cv2
+                            comp = cv2.cvtColor(
+                                comp.astype(np.uint8), cv2.COLOR_RGB2BGR
+                            )
+                            top = max(region.y0, ymin)
+                            bottom = min(region.y1, ymax)
+                            if bottom <= top:
+                                continue
+                            frame[top:bottom, region.x0:region.x1, :] = comp[
+                                top - ymin:bottom - ymin, region.x0:region.x1, :
+                            ]
+
+                units_done += len(frames_hr) * len(span.regions)
+                for frame in frames_hr:
+                    writer.write(frame)
+                    frames_done += 1
+                report(units_done)
+
+        # Metadata frame counts can under-report; never drop trailing frames.
+        while True:
+            success, image = reader.read()
+            if not success:
+                break
+            writer.write(image)
+            frames_done += 1
+        report(total_units)
     finally:
         reader.release()
         writer.release()

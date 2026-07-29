@@ -3,7 +3,9 @@
 Proxies requests to the inpaint-service microservice. Jobs are long-running
 background tasks on the service side; the frontend polls /jobs/{job_id},
 can abort via /jobs/{job_id}/cancel, and downloads the processed video from
-/result/{job_id}. /detect-region synchronously suggests the subtitle box.
+/result/{job_id}. /detect-region synchronously suggests one subtitle box for
+the whole video; /detect-timeline suggests a per-segment schedule for
+compilations whose captions move between clips.
 """
 
 import logging
@@ -23,6 +25,9 @@ UPLOAD_TIMEOUT = httpx.Timeout(600.0, connect=10.0)
 RESULT_TIMEOUT = httpx.Timeout(600.0, connect=10.0)
 # Region detection is synchronous on the service side (~seconds).
 DETECT_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
+# Timeline detection walks the whole file window by window (up to ~400
+# decoded frames), so it needs more headroom than single-region detection.
+DETECT_TIMELINE_TIMEOUT = httpx.Timeout(180.0, connect=10.0)
 
 
 def _service_unavailable() -> HTTPException:
@@ -61,23 +66,71 @@ async def detect_region(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail="Region detection failed.")
 
 
+@router.post("/detect-timeline")
+async def detect_timeline(
+    file: UploadFile = File(...),
+    window_seconds: float | None = Form(None),
+):
+    """Detect burned-in subtitle regions over time in a video.
+
+    Synchronous passthrough to the inpaint service's windowed heuristic.
+    Returns {segments: [{start, end, regions: [{x1, y1, x2, y2}],
+    hit_ratio}], duration, frames_sampled, windows} — seconds for times,
+    fractions (0-1) of the frame for coordinates. Feed the segments back as
+    the `schedule` field of /remove-subtitles.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=DETECT_TIMELINE_TIMEOUT) as client:
+            files = {"file": (file.filename, await file.read(), file.content_type)}
+            data = (
+                {"window_seconds": str(window_seconds)}
+                if window_seconds is not None
+                else None
+            )
+            resp = await client.post(
+                f"{settings.INPAINT_SERVICE_URL}/detect-timeline",
+                files=files,
+                data=data,
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as e:
+        detail = e.response.text if e.response else str(e)
+        raise HTTPException(status_code=e.response.status_code, detail=detail)
+    except httpx.ConnectError:
+        raise _service_unavailable()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Timeline detection proxy failed")
+        raise HTTPException(status_code=500, detail="Timeline detection failed.")
+
+
 @router.post("/remove-subtitles")
 async def remove_subtitles(
     file: UploadFile = File(...),
-    x1: float = Form(...),
-    y1: float = Form(...),
-    x2: float = Form(...),
-    y2: float = Form(...),
+    x1: float | None = Form(None),
+    y1: float | None = Form(None),
+    x2: float | None = Form(None),
+    y2: float | None = Form(None),
+    schedule: str | None = Form(None),
 ):
     """Start a burned-in subtitle removal job.
 
-    Region coordinates are fractions (0-1) of the frame describing the box
-    that contains the subtitles. Returns {job_id} for polling.
+    Either `schedule` — JSON [{start, end, regions: [{x1, y1, x2, y2}]}] from
+    /detect-timeline, which takes precedence — or the four region fields for
+    a single box covering the whole video. Coordinates are fractions (0-1) of
+    the frame. Returns {job_id} for polling.
     """
     try:
         async with httpx.AsyncClient(timeout=UPLOAD_TIMEOUT) as client:
             files = {"file": (file.filename, await file.read(), file.content_type)}
-            data = {"x1": str(x1), "y1": str(y1), "x2": str(x2), "y2": str(y2)}
+            data: dict[str, str] = {}
+            if schedule:
+                data["schedule"] = schedule
+            for key, value in (("x1", x1), ("y1", y1), ("x2", x2), ("y2", y2)):
+                if value is not None:
+                    data[key] = str(value)
             resp = await client.post(
                 f"{settings.INPAINT_SERVICE_URL}/inpaint", files=files, data=data
             )

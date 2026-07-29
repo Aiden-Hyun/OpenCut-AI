@@ -24,15 +24,19 @@ import { SMALLEST_STT_LANGUAGES } from "@/constants/smallest-constants";
 import type { TranscriptionLanguage, TranscriptionEngine } from "@/types/transcription";
 
 import { Spinner } from "@/components/ui/spinner";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { cn } from "@/utils/ui";
 import { useTranscriptStore } from "@/stores/transcript-store";
 import { usePreviewStore } from "@/stores/preview-store";
 import { getElementsAtTime, hasMediaId } from "@/lib/timeline";
 import { processMediaAssets } from "@/lib/media/processing";
 import { toast } from "sonner";
 import { aiClient } from "@/lib/ai-client";
+import type { SubtitleTimelineDetection } from "@/lib/ai-client";
+import { formatTimeCode } from "@/lib/time";
 import type { TimelineElement } from "@/types/timeline";
 import { useBackgroundTasksStore } from "@/stores/background-tasks-store";
 
@@ -67,20 +71,37 @@ export function Captions() {
 	const [inpaintJobId, setInpaintJobId] = useState<string | null>(null);
 	const [isCancellingInpaint, setIsCancellingInpaint] = useState(false);
 	const [isDetectingRegion, setIsDetectingRegion] = useState(false);
+	// Detected timeline of burned-in regions. While it is set the panel is in
+	// schedule mode: the reviewable segment list replaces the manual region
+	// inputs and the job runs off the enabled segments. "Clear detection"
+	// drops it and returns to the manual single-region flow.
+	const [detection, setDetection] = useState<SubtitleTimelineDetection | null>(
+		null,
+	);
+	const [enabledSegments, setEnabledSegments] = useState<boolean[]>([]);
+	// Segment the playhead currently sits in — drives the preview boxes and
+	// the highlighted row.
+	const [activeSegment, setActiveSegment] = useState<number | null>(null);
 	// Set by the Stop button; the polling loop exits on its next tick.
 	const inpaintStopRequestedRef = useRef(false);
 	const containerRef = useRef<HTMLDivElement>(null);
 	const segments = useTranscriptStore((s) => s.segments);
-	const setInpaintRegionOverlay = usePreviewStore(
-		(s) => s.setInpaintRegionOverlay,
+	const setInpaintRegionOverlays = usePreviewStore(
+		(s) => s.setInpaintRegionOverlays,
 	);
 	const editor = useEditor();
 
-	// Mirror the removal region onto the preview as a highlight box whenever
-	// the inputs form a valid region and the preview toggle is on.
+	// Mirror the removal regions onto the preview as highlight boxes: the
+	// active segment's regions in schedule mode, the manual box otherwise.
 	useEffect(() => {
 		if (!showRegionOnPreview) {
-			setInpaintRegionOverlay(null);
+			setInpaintRegionOverlays([]);
+			return;
+		}
+		if (detection) {
+			const segment =
+				activeSegment === null ? undefined : detection.segments[activeSegment];
+			setInpaintRegionOverlays(segment?.regions ?? []);
 			return;
 		}
 		const region = {
@@ -95,13 +116,45 @@ export function Captions() {
 			) &&
 			region.x2 > region.x1 &&
 			region.y2 > region.y1;
-		setInpaintRegionOverlay(isValid ? region : null);
-	}, [showRegionOnPreview, inpaintRegion, setInpaintRegionOverlay]);
+		setInpaintRegionOverlays(isValid ? [region] : []);
+	}, [
+		showRegionOnPreview,
+		inpaintRegion,
+		detection,
+		activeSegment,
+		setInpaintRegionOverlays,
+	]);
+
+	// Follow the playhead while a detection is loaded so scrubbing shows the
+	// boxes for the stretch on screen. State only changes when the segment
+	// does, so this does not re-render the panel every frame.
+	useEffect(() => {
+		if (!detection) {
+			setActiveSegment(null);
+			return;
+		}
+		let running = true;
+		let frame = 0;
+		const tick = () => {
+			if (!running) return;
+			const time = editor.playback.getCurrentTime();
+			const index = detection.segments.findIndex(
+				(segment) => time >= segment.start && time < segment.end,
+			);
+			setActiveSegment(index === -1 ? null : index);
+			frame = requestAnimationFrame(tick);
+		};
+		frame = requestAnimationFrame(tick);
+		return () => {
+			running = false;
+			cancelAnimationFrame(frame);
+		};
+	}, [detection, editor]);
 
 	// Remove the highlight when leaving the Captions view
 	useEffect(() => {
 		return () => {
-			usePreviewStore.getState().setInpaintRegionOverlay(null);
+			usePreviewStore.getState().setInpaintRegionOverlays([]);
 		};
 	}, []);
 
@@ -780,7 +833,15 @@ export function Captions() {
 		return { file };
 	};
 
-	const handleDetectRegion = async () => {
+	/** Segments the Remove job would run on: enabled and with regions. */
+	const scheduledSegments = detection
+		? detection.segments.filter(
+				(segment, index) =>
+					enabledSegments[index] && segment.regions.length > 0,
+			)
+		: [];
+
+	const handleDetectSubtitles = async () => {
 		try {
 			setIsDetectingRegion(true);
 			setInpaintError(null);
@@ -791,24 +852,31 @@ export function Captions() {
 				return;
 			}
 
-			const result = await aiClient.detectSubtitleRegion(resolved.file);
-			if (result.found && result.region) {
-				setInpaintRegion({
-					x1: result.region.x1.toFixed(3),
-					y1: result.region.y1.toFixed(3),
-					x2: result.region.x2.toFixed(3),
-					y2: result.region.y2.toFixed(3),
-				});
-				toast.success(
-					`Text band found in ${Math.round(result.hit_ratio * 100)}% of sampled frames — review the box, then Remove`,
-				);
-			} else {
+			const result = await aiClient.detectSubtitleTimeline(resolved.file);
+			const withRegions = result.segments.filter(
+				(segment) => segment.regions.length > 0,
+			);
+			if (withRegions.length === 0) {
 				toast.error("No recurring text band detected — set the region manually");
+				return;
 			}
+			setDetection(result);
+			// Stretches with nothing to erase start disabled; there is no work
+			// to do there and enabling them would only cost time.
+			setEnabledSegments(
+				result.segments.map((segment) => segment.regions.length > 0),
+			);
+			const areas = withRegions.reduce(
+				(sum, segment) => sum + segment.regions.length,
+				0,
+			);
+			toast.success(
+				`${withRegions.length} stretch${withRegions.length === 1 ? "" : "es"} with burned-in text (${areas} area${areas === 1 ? "" : "s"}) — review, then Remove`,
+			);
 		} catch (err) {
-			console.error("Region detection failed:", err);
+			console.error("Subtitle detection failed:", err);
 			const message =
-				err instanceof Error ? err.message : "Region detection failed";
+				err instanceof Error ? err.message : "Subtitle detection failed";
 			if (
 				message.includes("Cannot connect") ||
 				message.includes("connection_refused") ||
@@ -823,6 +891,27 @@ export function Captions() {
 		} finally {
 			setIsDetectingRegion(false);
 		}
+	};
+
+	/** Drop the detection and go back to the manual single-region flow. */
+	const handleClearDetection = () => {
+		setDetection(null);
+		setEnabledSegments([]);
+		setActiveSegment(null);
+	};
+
+	/** Scrub the playhead to a segment so its boxes show on the preview. */
+	const handleSelectSegment = (index: number) => {
+		const segment = detection?.segments[index];
+		if (!segment) return;
+		setActiveSegment(index);
+		editor.playback.seek({ time: segment.start });
+	};
+
+	const handleToggleSegment = (index: number) => {
+		setEnabledSegments((prev) =>
+			prev.map((enabled, i) => (i === index ? !enabled : enabled)),
+		);
 	};
 
 	const handleStopInpaint = async () => {
@@ -843,14 +932,22 @@ export function Captions() {
 		const taskId = `inpaint-${Date.now()}`;
 		const bgTasks = useBackgroundTasksStore.getState();
 
-		// Validate the region inputs
+		// Schedule mode runs on the enabled detected segments; manual mode on
+		// the four inputs, which are validated the same way as before.
 		const region = {
 			x1: Number.parseFloat(inpaintRegion.x1),
 			y1: Number.parseFloat(inpaintRegion.y1),
 			x2: Number.parseFloat(inpaintRegion.x2),
 			y2: Number.parseFloat(inpaintRegion.y2),
 		};
-		if (
+		if (detection) {
+			if (scheduledSegments.length === 0) {
+				setInpaintError(
+					"No segments selected. Enable at least one detected segment, or clear the detection to set a region manually.",
+				);
+				return;
+			}
+		} else if (
 			[region.x1, region.y1, region.x2, region.y2].some((v) =>
 				Number.isNaN(v),
 			) ||
@@ -891,7 +988,10 @@ export function Captions() {
 			});
 
 			setInpaintStep("Uploading video...");
-			const { job_id } = await aiClient.removeSubtitles(file, region);
+			const { job_id } = await aiClient.removeSubtitles(
+				file,
+				detection ? { schedule: scheduledSegments } : region,
+			);
 			setInpaintJobId(job_id);
 
 			// Poll every 3s until the job finishes or the user hits Stop
@@ -1281,49 +1381,117 @@ export function Captions() {
 						variant="outline"
 						size="sm"
 						className="w-full"
-						onClick={handleDetectRegion}
+						onClick={handleDetectSubtitles}
 						disabled={isDetectingRegion || isInpainting}
 					>
 						{isDetectingRegion && <Spinner className="mr-1" />}
 						{isDetectingRegion
 							? "Scanning video for text..."
-							: "Auto-detect region"}
+							: "Auto-detect subtitles"}
 					</Button>
 
-					<div className="grid grid-cols-2 gap-2">
-						{(
-							[
-								["x1", "Left (x1)"],
-								["y1", "Top (y1)"],
-								["x2", "Right (x2)"],
-								["y2", "Bottom (y2)"],
-							] as const
-						).map(([key, label]) => (
-							<div key={key} className="flex flex-col gap-1">
-								<Label
-									className="text-[10px] text-muted-foreground"
-									htmlFor={`inpaint-${key}`}
-								>
-									{label}
+					{detection ? (
+						<div className="flex flex-col gap-2">
+							<div className="flex items-center justify-between">
+								<Label className="text-xs">
+									Detected segments
+									<span className="ml-1 text-[10px] text-muted-foreground tabular-nums">
+										{detection.windows} windows
+									</span>
 								</Label>
-								<Input
-									id={`inpaint-${key}`}
-									type="number"
-									min={0}
-									max={1}
-									step={0.01}
-									value={inpaintRegion[key]}
+								<Button
+									variant="ghost"
+									size="sm"
+									className="h-6 px-2 text-xs text-muted-foreground"
+									onClick={handleClearDetection}
 									disabled={isInpainting}
-									onChange={(e) =>
-										setInpaintRegion((prev) => ({
-											...prev,
-											[key]: e.target.value,
-										}))
-									}
-								/>
+								>
+									Clear detection
+								</Button>
 							</div>
-						))}
-					</div>
+
+							<div className="flex max-h-52 flex-col gap-1 overflow-y-auto">
+								{detection.segments.map((segment, index) => (
+									<div
+										key={`${segment.start}-${segment.end}`}
+										className={cn(
+											"flex items-center gap-2 rounded-md border px-2 py-1.5",
+											index === activeSegment && "border-primary bg-muted/50",
+										)}
+									>
+										<Checkbox
+											id={`inpaint-segment-${index}`}
+											checked={enabledSegments[index] ?? false}
+											disabled={isInpainting || segment.regions.length === 0}
+											onCheckedChange={() => handleToggleSegment(index)}
+										/>
+										<button
+											type="button"
+											className="flex min-w-0 flex-1 items-center justify-between gap-2 text-left"
+											onClick={() => handleSelectSegment(index)}
+										>
+											<span className="text-[11px] tabular-nums">
+												{formatTimeCode({
+													timeInSeconds: segment.start,
+													format: "MM:SS",
+												})}
+												–
+												{formatTimeCode({
+													timeInSeconds: segment.end,
+													format: "MM:SS",
+												})}
+											</span>
+											<span className="text-[10px] text-muted-foreground shrink-0">
+												{segment.regions.length === 0
+													? "none"
+													: `${segment.regions.length} area${
+															segment.regions.length === 1 ? "" : "s"
+														}`}
+											</span>
+										</button>
+									</div>
+								))}
+							</div>
+							<p className="text-[10px] text-muted-foreground">
+								Click a row to jump there and check its boxes on the preview.
+							</p>
+						</div>
+					) : (
+						<div className="grid grid-cols-2 gap-2">
+							{(
+								[
+									["x1", "Left (x1)"],
+									["y1", "Top (y1)"],
+									["x2", "Right (x2)"],
+									["y2", "Bottom (y2)"],
+								] as const
+							).map(([key, label]) => (
+								<div key={key} className="flex flex-col gap-1">
+									<Label
+										className="text-[10px] text-muted-foreground"
+										htmlFor={`inpaint-${key}`}
+									>
+										{label}
+									</Label>
+									<Input
+										id={`inpaint-${key}`}
+										type="number"
+										min={0}
+										max={1}
+										step={0.01}
+										value={inpaintRegion[key]}
+										disabled={isInpainting}
+										onChange={(e) =>
+											setInpaintRegion((prev) => ({
+												...prev,
+												[key]: e.target.value,
+											}))
+										}
+									/>
+								</div>
+							))}
+						</div>
+					)}
 
 					<div className="flex items-center justify-between gap-2">
 						<div className="flex flex-col">
@@ -1331,7 +1499,9 @@ export function Captions() {
 								Show on preview
 							</Label>
 							<span className="text-[10px] text-muted-foreground">
-								The green box shows what will be erased.
+								{detection
+									? "Green boxes show what will be erased at the playhead."
+									: "The green box shows what will be erased."}
 							</span>
 						</div>
 						<Switch
@@ -1378,6 +1548,12 @@ export function Captions() {
 					)}
 
 					<p className="text-[10px] text-muted-foreground">
+						{detection
+							? `Will erase ${scheduledSegments.reduce(
+									(sum, segment) => sum + segment.regions.length,
+									0,
+								)} area(s) across ${scheduledSegments.length} selected segment(s); the rest of the video is left untouched.`
+							: "Will erase the region above for the whole video."}{" "}
 						CPU processing is slow — expect several minutes per video minute.
 					</p>
 				</div>

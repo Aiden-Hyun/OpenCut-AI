@@ -20,7 +20,10 @@ export interface InpaintRegionOverlay {
 interface PreviewState {
 	layoutGuide: LayoutGuideSettings;
 	overlays: PreviewOverlaysState;
-	inpaintRegionOverlay: InpaintRegionOverlay | null;
+	/** Boxes the Captions panel wants highlighted on the preview. A single
+	 *  manual region is an array of one; a detected segment can hold
+	 *  several. Transient — never persisted. */
+	inpaintRegionOverlays: InpaintRegionOverlay[];
 	setLayoutGuide: (settings: Partial<LayoutGuideSettings>) => void;
 	toggleLayoutGuide: (platform: TPlatformLayout) => void;
 	setOverlayVisibility: ({
@@ -35,7 +38,7 @@ interface PreviewState {
 	}: {
 		overlay: keyof PreviewOverlaysState;
 	}) => void;
-	setInpaintRegionOverlay: (region: InpaintRegionOverlay | null) => void;
+	setInpaintRegionOverlays: (regions: InpaintRegionOverlay[]) => void;
 }
 
 const DEFAULT_PREVIEW_OVERLAYS: PreviewOverlaysState = {
@@ -47,7 +50,7 @@ export const usePreviewStore = create<PreviewState>()(
 		(set) => ({
 			layoutGuide: { platform: null },
 			overlays: DEFAULT_PREVIEW_OVERLAYS,
-			inpaintRegionOverlay: null,
+			inpaintRegionOverlays: [],
 			setLayoutGuide: (settings) => {
 				set((state) => ({
 					layoutGuide: {
@@ -79,8 +82,8 @@ export const usePreviewStore = create<PreviewState>()(
 					},
 				}));
 			},
-			setInpaintRegionOverlay: (region) => {
-				set({ inpaintRegionOverlay: region });
+			setInpaintRegionOverlays: (regions) => {
+				set({ inpaintRegionOverlays: regions });
 			},
 		}),
 		{

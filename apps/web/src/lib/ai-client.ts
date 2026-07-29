@@ -78,12 +78,41 @@ export interface InpaintJobStatus {
 	error?: string | null;
 }
 
+/** A box to erase, as fractions (0-1) of the frame. */
+export interface SubtitleRegion {
+	x1: number;
+	y1: number;
+	x2: number;
+	y2: number;
+}
+
 export interface SubtitleRegionDetection {
 	found: boolean;
-	region: { x1: number; y1: number; x2: number; y2: number } | null;
+	region: SubtitleRegion | null;
 	/** Fraction of sampled frames with text inside the detected band. */
 	hit_ratio: number;
 	frames_sampled: number;
+}
+
+/** A stretch of the video and the burned-in regions active in it.
+ *  `regions: []` means there is nothing to erase there. */
+export interface SubtitleSegment {
+	/** Seconds. */
+	start: number;
+	/** Seconds. */
+	end: number;
+	regions: SubtitleRegion[];
+	/** Fraction of frames sampled in this segment that showed text. */
+	hit_ratio: number;
+}
+
+export interface SubtitleTimelineDetection {
+	segments: SubtitleSegment[];
+	/** Video duration in seconds. */
+	duration: number;
+	frames_sampled: number;
+	/** Number of time windows analysed. */
+	windows: number;
 }
 
 export class AIClientError extends Error {
@@ -514,17 +543,32 @@ class AIClient {
 	}
 
 	/** Start a burned-in subtitle removal (STTN inpainting) job.
-	 *  Region coordinates are fractions (0-1) of the frame. */
+	 *  Pass a single region to erase one box for the whole video, or
+	 *  `{ schedule }` from detectSubtitleTimeline to erase time-varying
+	 *  region sets in one job. Coordinates are fractions (0-1) of the frame. */
 	async removeSubtitles(
 		file: File,
-		region: { x1: number; y1: number; x2: number; y2: number },
+		target: SubtitleRegion | { schedule: SubtitleSegment[] },
 	): Promise<{ job_id: string }> {
 		const formData = new FormData();
 		formData.append("file", file);
-		formData.append("x1", region.x1.toString());
-		formData.append("y1", region.y1.toString());
-		formData.append("x2", region.x2.toString());
-		formData.append("y2", region.y2.toString());
+		if ("schedule" in target) {
+			formData.append(
+				"schedule",
+				JSON.stringify(
+					target.schedule.map((segment) => ({
+						start: segment.start,
+						end: segment.end,
+						regions: segment.regions,
+					})),
+				),
+			);
+		} else {
+			formData.append("x1", target.x1.toString());
+			formData.append("y1", target.y1.toString());
+			formData.append("x2", target.x2.toString());
+			formData.append("y2", target.y2.toString());
+		}
 
 		return this.requestFormData<{ job_id: string }>(
 			"/api/inpaint/remove-subtitles",
@@ -541,6 +585,26 @@ class AIClient {
 
 		return this.requestFormData<SubtitleRegionDetection>(
 			"/api/inpaint/detect-region",
+			formData,
+			UPLOAD_TIMEOUT_MS,
+		);
+	}
+
+	/** Detect burned-in subtitle regions over TIME (synchronous).
+	 *  Returns contiguous segments, each with the regions active in it —
+	 *  feed them back to removeSubtitles as `{ schedule }`. */
+	async detectSubtitleTimeline(
+		file: File,
+		windowSeconds?: number,
+	): Promise<SubtitleTimelineDetection> {
+		const formData = new FormData();
+		formData.append("file", file);
+		if (windowSeconds !== undefined) {
+			formData.append("window_seconds", windowSeconds.toString());
+		}
+
+		return this.requestFormData<SubtitleTimelineDetection>(
+			"/api/inpaint/detect-timeline",
 			formData,
 			UPLOAD_TIMEOUT_MS,
 		);

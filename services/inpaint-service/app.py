@@ -1,16 +1,23 @@
 """STTN video inpainting microservice.
 
 Standalone FastAPI service that removes burned-in (hardcoded) subtitles
-from video by inpainting a caller-supplied rectangular region with STTN
+from video by inpainting caller-supplied rectangular regions with STTN
 (Spatial-Temporal Transformer Networks). Jobs run in a background thread,
-are polled by id and can be cancelled mid-run. /detect-region suggests the
-subtitle region via a pure-OpenCV heuristic. Runs on port 8427.
+are polled by id and can be cancelled mid-run. Runs on port 8427.
+
+A job takes either one region for the whole file or a SCHEDULE — time
+ranges each with their own set of regions — so a compilation whose captions
+move around (or double up) is cleaned in a single continuous encode.
+/detect-region suggests one whole-video region and /detect-timeline suggests
+a whole schedule, both via the same pure-OpenCV heuristic.
 
 Model weights come from the video-subtitle-remover project (Apache-2.0)
 and are lazy-downloaded on first use into ~/.cache.
 """
 
+import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -26,7 +33,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from detect import detect_subtitle_region
+from detect import WINDOW_SECONDS, detect_subtitle_region, detect_subtitle_timeline
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -59,6 +66,15 @@ os.makedirs(RESULT_DIR, exist_ok=True)
 
 ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv"}
 
+# Schedule sanity limits: a 13-minute compilation detects as tens of
+# segments, so these are generous, but they stop a malformed request from
+# planning millions of STTN passes.
+MAX_SCHEDULE_ENTRIES = 500
+MAX_REGIONS_PER_ENTRY = 8
+# Detection window bounds for /detect-timeline (seconds).
+MIN_WINDOW_SECONDS = 0.5
+MAX_WINDOW_SECONDS = 60.0
+
 
 def _resolve_device() -> str:
     """Pick the torch device for STTN: DEVICE env wins, else auto-detect."""
@@ -67,6 +83,138 @@ def _resolve_device() -> str:
     import torch
 
     return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# ---------------------------------------------------------------------------
+# Request helpers
+# ---------------------------------------------------------------------------
+
+
+def _checked_extension(filename: str | None) -> str:
+    """Lowercase suffix of an upload, rejecting unsupported containers."""
+    if not filename:
+        raise HTTPException(status_code=400, detail="No filename provided.")
+    ext = Path(filename).suffix.lower()
+    if ext not in ALLOWED_VIDEO_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}'. Allowed: {sorted(ALLOWED_VIDEO_EXTENSIONS)}",
+        )
+    return ext
+
+
+async def _store_upload(file: UploadFile, path: str, label: str) -> None:
+    """Write an upload to disk, mapping any failure to HTTP 500."""
+    try:
+        contents = await file.read()
+        with open(path, "wb") as f:
+            f.write(contents)
+    except Exception:
+        logger.exception("Failed to store upload for %s", label)
+        raise HTTPException(status_code=500, detail="Failed to store upload.")
+
+
+def _unprocessable(detail: str) -> HTTPException:
+    return HTTPException(status_code=422, detail=detail)
+
+
+def _schedule_number(raw: object, where: str) -> float:
+    """Parse a finite number out of the schedule JSON, or HTTP 422."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise _unprocessable(f"{where} must be a number of seconds.")
+    value = float(raw)
+    if math.isnan(value) or math.isinf(value):
+        raise _unprocessable(f"{where} must be a finite number of seconds.")
+    return value
+
+
+def _schedule_region(raw: object, where: str) -> tuple[float, float, float, float]:
+    """Parse one fractional region out of the schedule JSON, or HTTP 422."""
+    if not isinstance(raw, dict):
+        raise _unprocessable(f"{where} must be an object with x1, y1, x2, y2.")
+    values = []
+    for key in ("x1", "y1", "x2", "y2"):
+        if key not in raw:
+            raise _unprocessable(f"{where} is missing '{key}'.")
+        values.append(_schedule_number(raw[key], f"{where}.{key}"))
+    x1, y1, x2, y2 = values
+    if not (0.0 <= x1 < x2 <= 1.0 and 0.0 <= y1 < y2 <= 1.0):
+        raise _unprocessable(
+            f"{where} must satisfy 0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1 "
+            "(fractions of the frame)."
+        )
+    return (x1, y1, x2, y2)
+
+
+def _parse_schedule(raw: str) -> list[dict]:
+    """Validate a JSON schedule into pipeline entries.
+
+    Input is ``[{"start": seconds, "end": seconds, "regions": [{x1, y1, x2,
+    y2}, ...]}]``. Entries are sorted by start and clamped so they never
+    overlap (a later entry starts where the previous one ended); anything
+    that survives with no time left is dropped. Malformed input is rejected
+    with HTTP 422 rather than silently repaired.
+    """
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise _unprocessable(f"schedule is not valid JSON: {e}")
+    if not isinstance(parsed, list) or not parsed:
+        raise _unprocessable(
+            "schedule must be a non-empty JSON array of "
+            "{start, end, regions} entries."
+        )
+    if len(parsed) > MAX_SCHEDULE_ENTRIES:
+        raise _unprocessable(
+            f"schedule has {len(parsed)} entries; the maximum is {MAX_SCHEDULE_ENTRIES}."
+        )
+
+    entries: list[dict] = []
+    for index, item in enumerate(parsed):
+        where = f"schedule[{index}]"
+        if not isinstance(item, dict):
+            raise _unprocessable(f"{where} must be an object.")
+        start = _schedule_number(item.get("start"), f"{where}.start")
+        end = _schedule_number(item.get("end"), f"{where}.end")
+        if end <= start:
+            raise _unprocessable(f"{where}.end must be greater than {where}.start.")
+        regions = item.get("regions", [])
+        if not isinstance(regions, list):
+            raise _unprocessable(f"{where}.regions must be an array.")
+        if len(regions) > MAX_REGIONS_PER_ENTRY:
+            raise _unprocessable(
+                f"{where}.regions has {len(regions)} regions; the maximum is "
+                f"{MAX_REGIONS_PER_ENTRY}."
+            )
+        entries.append(
+            {
+                "start": max(0.0, start),
+                "end": end,
+                "regions": [
+                    _schedule_region(region, f"{where}.regions[{i}]")
+                    for i, region in enumerate(regions)
+                ],
+            }
+        )
+
+    entries.sort(key=lambda entry: entry["start"])
+    clamped: list[dict] = []
+    cursor = 0.0
+    for entry in entries:
+        start = max(entry["start"], cursor)
+        if entry["end"] <= start:
+            logger.info(
+                "Dropping schedule entry %.2f-%.2fs: fully covered by an earlier entry",
+                entry["start"], entry["end"],
+            )
+            continue
+        clamped.append({**entry, "start": start})
+        cursor = entry["end"]
+    if not clamped:
+        raise _unprocessable(
+            "schedule has no usable entries after sorting and clamping overlaps."
+        )
+    return clamped
 
 # ---------------------------------------------------------------------------
 # Job store (in-memory; jobs are ephemeral like the container filesystem)
@@ -235,12 +383,12 @@ def _mux_output(raw_path: str, source_path: str, final_path: str) -> None:
         raise RuntimeError(f"ffmpeg mux failed: {result.stderr[-500:]}")
 
 
-def _process_job(
-    job_id: str,
-    input_path: str,
-    region: tuple[float, float, float, float],
-) -> None:
-    """Worker thread: download weights, inpaint frames, mux audio."""
+def _process_job(job_id: str, input_path: str, schedule: list[dict]) -> None:
+    """Worker thread: download weights, inpaint frames, mux audio.
+
+    ``schedule`` is the validated pipeline schedule — one whole-video entry
+    for a single-region job, one entry per detected segment otherwise.
+    """
     from sttn.pipeline import InpaintCancelled, inpaint_video
 
     raw_path = os.path.join(RESULT_DIR, f"{job_id}_raw.mp4")
@@ -257,16 +405,21 @@ def _process_job(
                 raise InpaintCancelled("Cancelled while preparing model.")
             _update_job(job_id, progress=0.05, message="Inpainting frames...")
 
-            def on_progress(done: int, total: int) -> None:
+            def on_progress(progress) -> None:
+                # progress.fraction is weighted by region-frames, so it moves
+                # evenly whether a stretch has zero, one or two active regions.
                 _update_job(
                     job_id,
-                    progress=0.05 + 0.85 * (done / total),
-                    message=f"Inpainting frames ({done}/{total})...",
+                    progress=0.05 + 0.85 * progress.fraction,
+                    message=(
+                        f"Inpainting frames ({progress.frames_written}/"
+                        f"{progress.total_frames})..."
+                    ),
                 )
 
             start = time.time()
             frames = inpaint_video(
-                inpainter, input_path, raw_path, region, on_progress,
+                inpainter, input_path, raw_path, schedule, on_progress,
                 should_cancel=lambda: _cancel_requested(job_id),
             )
 
@@ -342,25 +495,10 @@ async def detect_region(file: UploadFile = File(...)):
     Response: {found, region: {x1, y1, x2, y2} | null, hit_ratio,
     frames_sampled}.
     """
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No filename provided.")
-
-    ext = Path(file.filename).suffix.lower()
-    if ext not in ALLOWED_VIDEO_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file type '{ext}'. Allowed: {sorted(ALLOWED_VIDEO_EXTENSIONS)}",
-        )
-
+    ext = _checked_extension(file.filename)
     detect_id = uuid.uuid4().hex[:12]
     input_path = os.path.join(UPLOAD_DIR, f"detect_{detect_id}{ext}")
-    try:
-        contents = await file.read()
-        with open(input_path, "wb") as f:
-            f.write(contents)
-    except Exception:
-        logger.exception("Failed to store upload for detection %s", detect_id)
-        raise HTTPException(status_code=500, detail="Failed to store upload.")
+    await _store_upload(file, input_path, f"detection {detect_id}")
 
     try:
         # CPU-bound OpenCV work; keep the event loop free.
@@ -381,59 +519,118 @@ async def detect_region(file: UploadFile = File(...)):
     return result
 
 
+@app.post("/detect-timeline")
+async def detect_timeline(
+    file: UploadFile = File(...),
+    window_seconds: float = Form(WINDOW_SECONDS),
+):
+    """Detect burned-in subtitle regions over TIME for the uploaded video.
+
+    Synchronous (no job): walks the video in ~window_seconds windows, keeps
+    every qualifying text band per window and groups adjacent windows with
+    the same region set into segments, ready to feed into /inpaint as a
+    schedule. Same pure-OpenCV heuristic as /detect-region.
+    Response: {segments: [{start, end, regions: [{x1, y1, x2, y2}],
+    hit_ratio}], duration, frames_sampled, windows} — seconds for times,
+    fractions (0-1) of the frame for coordinates.
+    """
+    if not MIN_WINDOW_SECONDS <= window_seconds <= MAX_WINDOW_SECONDS:
+        raise _unprocessable(
+            f"window_seconds must be between {MIN_WINDOW_SECONDS} and "
+            f"{MAX_WINDOW_SECONDS} seconds."
+        )
+
+    ext = _checked_extension(file.filename)
+    detect_id = uuid.uuid4().hex[:12]
+    input_path = os.path.join(UPLOAD_DIR, f"timeline_{detect_id}{ext}")
+    await _store_upload(file, input_path, f"timeline detection {detect_id}")
+
+    try:
+        # CPU-bound OpenCV work; keep the event loop free.
+        result = await run_in_threadpool(
+            detect_subtitle_timeline, input_path, window_seconds
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("Timeline detection %s failed", detect_id)
+        raise HTTPException(status_code=500, detail="Timeline detection failed.")
+    finally:
+        if os.path.exists(input_path):
+            os.remove(input_path)
+
+    logger.info(
+        "Timeline detection %s (%s): %d segments over %.1fs (%d frames sampled)",
+        detect_id, file.filename, len(result["segments"]), result["duration"],
+        result["frames_sampled"],
+    )
+    return result
+
+
 @app.post("/inpaint")
 async def inpaint(
     file: UploadFile = File(...),
-    x1: float = Form(...),
-    y1: float = Form(...),
-    x2: float = Form(...),
-    y2: float = Form(...),
+    x1: float | None = Form(None),
+    y1: float | None = Form(None),
+    x2: float | None = Form(None),
+    y2: float | None = Form(None),
+    schedule: str | None = Form(None),
 ):
     """Start a subtitle-removal job for the uploaded video.
 
-    Region coordinates are FRACTIONS (0-1) of the frame; (x1, y1) is the
-    top-left and (x2, y2) the bottom-right of the box containing the
-    burned-in subtitles. Returns a job_id to poll via /jobs/{job_id}.
+    Two ways to say what to erase, both in FRACTIONS (0-1) of the frame:
+
+    *   ``schedule`` — JSON ``[{"start": seconds, "end": seconds, "regions":
+        [{x1, y1, x2, y2}, ...]}]`` from /detect-timeline. Regions vary by
+        timestamp; an entry with an empty region list passes those frames
+        through untouched. Takes precedence when present.
+    *   ``x1, y1, x2, y2`` — one box for the whole video, where (x1, y1) is
+        the top-left and (x2, y2) the bottom-right. Handled internally as a
+        one-entry schedule spanning the file.
+
+    Returns a job_id to poll via /jobs/{job_id}.
     """
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No filename provided.")
+    ext = _checked_extension(file.filename)
 
-    ext = Path(file.filename).suffix.lower()
-    if ext not in ALLOWED_VIDEO_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file type '{ext}'. Allowed: {sorted(ALLOWED_VIDEO_EXTENSIONS)}",
+    if schedule:
+        entries = _parse_schedule(schedule)
+        summary = (
+            f"schedule with {len(entries)} entries, "
+            f"{sum(len(e['regions']) for e in entries)} regions"
         )
-
-    if not (0.0 <= x1 < x2 <= 1.0 and 0.0 <= y1 < y2 <= 1.0):
-        raise HTTPException(
-            status_code=400,
-            detail="Region must satisfy 0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1 (fractions of the frame).",
-        )
+    else:
+        if x1 is None or y1 is None or x2 is None or y2 is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide either a schedule or all four region fields "
+                "x1, y1, x2, y2.",
+            )
+        if not (0.0 <= x1 < x2 <= 1.0 and 0.0 <= y1 < y2 <= 1.0):
+            raise HTTPException(
+                status_code=400,
+                detail="Region must satisfy 0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1 (fractions of the frame).",
+            )
+        # One entry spanning the whole file: identical work to the old
+        # single-region job, just expressed as a schedule.
+        entries = [{"start": 0.0, "end": math.inf, "regions": [(x1, y1, x2, y2)]}]
+        summary = f"region=({x1:.3f},{y1:.3f})-({x2:.3f},{y2:.3f})"
 
     job_id = uuid.uuid4().hex[:12]
     input_path = os.path.join(UPLOAD_DIR, f"{job_id}{ext}")
-    try:
-        contents = await file.read()
-        with open(input_path, "wb") as f:
-            f.write(contents)
-    except Exception:
-        logger.exception("Failed to store upload for job %s", job_id)
-        raise HTTPException(status_code=500, detail="Failed to store upload.")
+    await _store_upload(file, input_path, f"job {job_id}")
 
     with _jobs_lock:
         _jobs[job_id] = Job(job_id=job_id, message="Waiting for worker...")
 
     thread = threading.Thread(
         target=_process_job,
-        args=(job_id, input_path, (x1, y1, x2, y2)),
+        args=(job_id, input_path, entries),
         daemon=True,
     )
     thread.start()
 
     logger.info(
-        "Inpaint job %s queued: file=%s region=(%.3f,%.3f)-(%.3f,%.3f)",
-        job_id, file.filename, x1, y1, x2, y2,
+        "Inpaint job %s queued: file=%s %s", job_id, file.filename, summary
     )
     return {"job_id": job_id}
 

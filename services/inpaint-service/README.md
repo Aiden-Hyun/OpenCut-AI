@@ -17,8 +17,27 @@ The STTN implementation is vendored from
   recurring burned-in subtitle band; constant overlays (watermarks/logos)
   are excluded by their lack of cross-frame content variance, and
   uniformly busy footage is rejected by a peak-dominance gate.
-- `POST /inpaint` — multipart `file` + form fields `x1, y1, x2, y2`
-  (fractions 0-1 of the frame; box containing the subtitles) → `{job_id}`
+- `POST /detect-timeline` — multipart `file` + optional form field
+  `window_seconds` (default 4) →
+  `{segments: [{start, end, regions: [{x1, y1, x2, y2}], hit_ratio}], duration, frames_sampled, windows}`.
+  Time-varying multi-region variant of `/detect-region` for compilations
+  whose captions move between clips (and sometimes double up): the video is
+  walked in short windows, every qualifying band per window is kept, and
+  adjacent windows with the same region set are grouped into segments.
+  Segments with `regions: []` have nothing to erase. Windows are widened
+  automatically so a long video stays under a ~400 frame sampling budget.
+- `POST /inpaint` — multipart `file` plus **either**
+  - form fields `x1, y1, x2, y2` (fractions 0-1 of the frame; one box for
+    the whole video), **or**
+  - form field `schedule`, JSON
+    `[{"start": seconds, "end": seconds, "regions": [{"x1": …, "y1": …, "x2": …, "y2": …}]}]`
+    as returned by `/detect-timeline` (it takes precedence over `x1..y2`).
+    Entries are sorted and clamped so they never overlap; frames covered by
+    no entry — or by an entry with an empty `regions` list — are copied
+    through untouched, and the whole job is still one continuous encode.
+    Malformed schedules are rejected with 422.
+
+  → `{job_id}`
 - `GET /jobs/{job_id}` — `{status: queued|processing|done|error|cancelled, progress, message}`
 - `POST /jobs/{job_id}/cancel` — abort a queued/running job (the worker
   polls the flag between STTN sliding windows and cleans up its temp
@@ -57,3 +76,6 @@ docker cp /tmp/infer_model.pth \
 - Frames are cropped to a full-width horizontal band around the region
   (16:3 aspect, resized to the model's 640x120 input) so the model never
   sees the whole frame, then composited back — VSR's speed trick.
+- Two regions active at the same timestamp cost two STTN passes over those
+  frames, run cumulatively (the second pass sees the first pass's output),
+  so job progress is weighted by region-frames rather than frames.
